@@ -119,7 +119,11 @@ BASELINES: tuple[Baseline, ...] = (
 
 def _fmt(value: float, spec: str = "6.3f") -> str:
     if value != value:  # NaN
-        return f"{'nan':>{spec.split('.')[0]}}"
+        # Strip the sign flag before reusing the width: "+9.3f" is a valid number format but
+        # ">+9" is not a valid string one, and a NaN delta is exactly what a constant
+        # prediction produces — snapping word.stress collapses it to a single value.
+        width = spec.split(".")[0].lstrip("+- ")
+        return f"{'nan':>{width}}"
     return f"{value:{spec}}"
 
 

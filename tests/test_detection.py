@@ -224,3 +224,26 @@ def test_target_stats_without_a_grid_load_cleanly(tmp_path):
     path.write_text(json.dumps({"mean": {"phone.accuracy": 1.9},
                                 "std": {"phone.accuracy": 0.37}}))
     assert TargetStats.load(path).support == {}
+
+
+def test_nan_formats_in_a_signed_column():
+    """A constant prediction gives a NaN delta, and ">+9" is not a valid string format.
+    Snapping word.stress collapses it to one value, so this is reachable, not theoretical."""
+    from tutokana.reporting import _fmt
+
+    assert _fmt(float("nan"), "+9.3f").strip() == "nan"
+    assert len(_fmt(float("nan"), "+9.3f")) == 9
+    assert _fmt(0.5, "+9.3f").strip() == "+0.500"
+
+
+def test_snapping_table_survives_a_field_that_collapses():
+    from tutokana.reporting import render_snapping
+
+    # The real failure mode: at a 99.2% base rate the model never predicts far from the
+    # ceiling, so every prediction snaps to the same grid point and the correlation is NaN.
+    gold = np.array([10.0] * 995 + [5.0] * 5)
+    pred = 9.9 + np.random.default_rng(0).normal(0, 0.02, gold.size)
+    raw = {"word.stress": field_metrics(pred, gold, bootstrap=False)}
+    snapped = {"word.stress": field_metrics(snap_to_support(pred, [5.0, 10.0]), gold,
+                                            bootstrap=False)}
+    assert "nan" in render_snapping(raw, snapped)  # renders rather than raising
