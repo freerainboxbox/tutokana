@@ -177,3 +177,120 @@ def transcription_metrics(
         n_words=words_total,
         n_phones=phones_total,
     )
+
+
+# --- detection ---------------------------------------------------------------------------
+# Spearman on this corpus is a detection metric in disguise. Decomposing the achievable SCC
+# on the test split shows where it actually lives:
+#
+#   phone.accuracy       perfect predictor (ceiling)                    0.680
+#                        perfect ceiling-vs-not, random ordering below  0.671   <- 99%
+#                        perfect ordering below, ceiling not detected   0.077   <-  1%
+#
+# So "improve the rank correlation" means "improve mispronunciation detection", and a
+# differentiable ranking loss would spend its gradient on orderings the metric cannot
+# reward. Reporting detection directly says so out loud instead of leaving it to be inferred
+# from a rank correlation.
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionMetrics:
+    """Separating imperfect labels from the ceiling, treating the score as a detector."""
+
+    positives: int          #: labels below the maximum — the mispronunciations
+    share: float            #: their share of the field, i.e. the base rate
+    auc: float              #: threshold-free ranking quality
+    f1: float               #: best F1 over all thresholds
+    precision: float
+    recall: float
+    threshold: float        #: predictions at or below this are called imperfect
+
+
+def detection_auc(prediction, gold) -> float:
+    """Probability a randomly chosen imperfect label scores below a randomly chosen perfect
+    one. Computed from ranks (Mann-Whitney U), so ties are handled and no sweep is needed."""
+    from scipy.stats import rankdata
+
+    pred = np.asarray(prediction, dtype=np.float64)
+    positive = np.asarray(gold, dtype=np.float64) < np.max(gold) if len(gold) else np.array([])
+    n_pos, n_neg = int(positive.sum()), int((~positive).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    # Lower prediction should mean "more likely imperfect", so rank the negated score.
+    ranks = rankdata(-pred)
+    return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def detection_metrics(prediction, gold) -> DetectionMetrics:
+    """Detection of "label below the maximum", scored from the continuous prediction.
+
+    The threshold is chosen to maximise F1 rather than fixed at a midpoint: the base rate is
+    0.8-19% depending on the field, so any fixed threshold would be arbitrary and would
+    understate a model that ranks well but is poorly calibrated.
+    """
+    pred = np.asarray(prediction, dtype=np.float64)
+    truth = np.asarray(gold, dtype=np.float64)
+    positive = truth < truth.max() if truth.size else np.array([], dtype=bool)
+    n_pos = int(positive.sum())
+    if truth.size == 0 or n_pos == 0 or n_pos == truth.size:
+        nan = float("nan")
+        return DetectionMetrics(n_pos, n_pos / max(truth.size, 1), nan, nan, nan, nan, nan)
+
+    # Sweep every distinct threshold in one pass: sort ascending, and calling everything up
+    # to position i "imperfect" makes true positives the cumulative count of positives.
+    order = np.argsort(pred, kind="mergesort")
+    hits = np.cumsum(positive[order])
+    called = np.arange(1, pred.size + 1)
+    precision = hits / called
+    recall = hits / n_pos
+    denominator = precision + recall
+    f1 = np.divide(2 * precision * recall, denominator,
+                   out=np.zeros_like(precision), where=denominator > 0)
+    best = int(np.argmax(f1))
+    return DetectionMetrics(
+        positives=n_pos,
+        share=n_pos / truth.size,
+        auc=detection_auc(pred, truth),
+        f1=float(f1[best]),
+        precision=float(precision[best]),
+        recall=float(recall[best]),
+        threshold=float(pred[order][best]),
+    )
+
+
+def snap_to_support(prediction, support) -> np.ndarray:
+    """Round predictions onto the values the labels actually take.
+
+    Gold is quantised — phone accuracy to 0.2, the 0-10 fields to integers — and a continuous
+    readout is not. Snapping restores the ties that quantisation created, which is what a
+    rank correlation is comparing against, and removes error smaller than half a grid step.
+    It is a change of scale, not a change of model: no retraining, and it cannot invent
+    ordering the predictions did not already have.
+    """
+    pred = np.asarray(prediction, dtype=np.float64)
+    grid = np.asarray(sorted(set(float(v) for v in support)), dtype=np.float64)
+    if grid.size == 0:
+        return pred
+    return grid[np.abs(pred[:, None] - grid[None, :]).argmin(axis=1)]
+
+
+def spearman_ceiling(gold, seed: int = 0, repeats: int = 5) -> float:
+    """The highest Spearman any *continuous* predictor can reach on these labels.
+
+    A continuous readout never produces ties, while gold is heavily tied — 81% of phone
+    accuracies at 2.0, 90% of word accuracies at 10. Reproducing gold exactly and breaking
+    its ties arbitrarily is therefore the best such a predictor can do, and that is what this
+    measures. On the test split it comes to 0.680 for phone accuracy and 0.528 for word
+    accuracy, against 0.96 for the utterance fields, which is most of why the levels look so
+    different. Without this column a reader compares 0.43 against 0.72 and draws the wrong
+    conclusion.
+    """
+    truth = np.asarray(gold, dtype=np.float64)
+    if truth.size < 2 or truth.std() == 0:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    scale = 1e-9 * max(float(np.abs(truth).max()), 1.0)
+    return float(
+        np.mean([spearman(truth + rng.normal(0, scale, truth.size), truth)
+                 for _ in range(repeats)])
+    )

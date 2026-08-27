@@ -300,6 +300,46 @@ score-range-restricted and understates correlation.
 PCC is reported as `nan` when either side is constant. That is the honest answer and is
 exactly how the collapse surfaced before — it is not rounded to zero.
 
+### Detection, and the Spearman ceiling
+
+Spearman on this corpus is a detection metric wearing a rank correlation's clothes, and the
+table now says so instead of leaving it to be inferred. Two columns were added because the
+raw SCC was being read as a model failure when most of it is a property of the labels.
+
+**The ceiling.** A continuous readout never ties; gold is heavily tied. So even a *perfect*
+continuous predictor is capped:
+
+| field | modal share | SCC ceiling |
+|---|---|---|
+| phone.accuracy | 81.3% | 0.680 |
+| word.accuracy | 89.7% | 0.528 |
+| word.total | 88.1% | 0.563 |
+| utterance.accuracy | 38.8% | 0.959 |
+
+Word SCC looks catastrophic next to utterance SCC only because word labels are 90% tied at
+10. Comparing 0.43 against 0.72 without this column draws the wrong conclusion.
+
+**Where the achievable SCC lives.** Decomposing it on the test split:
+
+| phone.accuracy | SCC |
+|---|---|
+| perfect predictor (the ceiling) | 0.680 |
+| perfect ceiling-vs-not detection, random ordering below | 0.671 |
+| perfect ordering below, ceiling not detected | 0.077 |
+
+Detection is 99% of it; ordering is 1%. So "improve the rank correlation" means "improve
+mispronunciation detection", and a differentiable ranking loss would spend its gradient on
+orderings the metric cannot reward. `--out` records detection AUC/F1 per field, and the
+detection table is skipped for fields with no dominant ceiling — utterance scores run 2-10
+with no modal value, so "below the maximum" is 95-99% of them and F1 reaches 0.999 by
+calling everything positive.
+
+**`--snap`** additionally scores predictions rounded onto the training label grid, which is
+persisted in `target_stats.json`. Gold is quantised (0.2 for phone, integers elsewhere) and
+a continuous readout is not; snapping restores those ties and removes error below half a
+grid step. It is applied after the fact and cannot invent ordering the predictions lacked.
+It is a per-field call, not a global one — it helps a fine grid and hurts a coarse one.
+
 ### Caveats carried deliberately
 
 - **`utterance.completeness`** is 10.0 for 99.6% of train. Every LMM paper reports NaN; only

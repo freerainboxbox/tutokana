@@ -39,11 +39,23 @@ from tutokana.collate import Collator
 from tutokana.data import TargetStats, load_split, stratified_indices
 from tutokana.engine import graceful_interrupt, score, seed_everything
 from tutokana.heads import build_head_specs
-from tutokana.metrics import transcription_metrics
+from tutokana.metrics import (
+    detection_metrics,
+    field_metrics,
+    snap_to_support,
+    spearman_ceiling,
+    transcription_metrics,
+)
 from tutokana.model import ModelConfig, build_model, load_processor, resolve_device
 from tutokana.prompting import TargetSpec, parse_generated
 from tutokana.progress import Progress
-from tutokana.reporting import render_baselines, render_table, render_transcription
+from tutokana.reporting import (
+    render_baselines,
+    render_detection,
+    render_snapping,
+    render_table,
+    render_transcription,
+)
 from tutokana.tokens import register_tokens
 
 
@@ -70,6 +82,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generative-samples", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--out", default="", help="write per-field predictions to this JSON file")
+    parser.add_argument(
+        "--no-detection", action="store_true",
+        help="skip the detection table. Spearman here is mostly a detection metric: perfect "
+             "ceiling-vs-not detection reaches 99%% of the achievable rank correlation, "
+             "perfect ordering below it reaches 1%%",
+    )
+    parser.add_argument(
+        "--snap", action="store_true",
+        help="also score predictions rounded onto the training label grid. Gold is "
+             "quantised and a continuous readout is not; snapping restores the ties a rank "
+             "correlation is comparing against. Applied after the fact, no retraining",
+    )
     return parser.parse_args()
 
 
@@ -191,7 +215,42 @@ def main() -> None:
             title += f" (PARTIAL: {result.scored}/{len(utterances)})"
         table = render_table(result.metrics, title=title)
         comparison = render_baselines(result.metrics)
-        for line in (table + "\n\n" + comparison).splitlines():
+        sections = [table, comparison]
+
+        detection = {}
+        if not args.no_detection:
+            detection = {
+                key: detection_metrics(result.predictions[key], result.gold[key])
+                for key in result.predictions
+            }
+            ceilings = {
+                key: (result.metrics[key].spearman, spearman_ceiling(result.gold[key]))
+                for key in result.predictions
+            }
+            sections.append(render_detection(detection, ceilings))
+
+        snapped_metrics = {}
+        if args.snap:
+            missing = [k for k in result.predictions if k not in (stats.support or {})]
+            if missing:
+                log.warning(
+                    "[snap] no label grid recorded for %s — this run predates support being "
+                    "written to target_stats.json, so those fields are left unsnapped",
+                    ", ".join(sorted(missing)),
+                )
+            snapped = {
+                key: snap_to_support(values, stats.support[key])
+                for key, values in result.predictions.items()
+                if key in (stats.support or {})
+            }
+            snapped_metrics = {
+                key: field_metrics(values, result.gold[key], bootstrap=False)
+                for key, values in snapped.items()
+            }
+            if snapped_metrics:
+                sections.append(render_snapping(result.metrics, snapped_metrics))
+
+        for line in "\n\n".join(sections).splitlines():
             log.info("%s", line)
 
         if args.generative:
@@ -219,6 +278,14 @@ def main() -> None:
                         "metrics": {
                             k: asdict(v) | {"sigma_ratio": v.sigma_ratio}
                             for k, v in result.metrics.items()
+                        },
+                        "detection": {k: asdict(v) for k, v in detection.items()},
+                        "spearman_ceiling": {
+                            k: spearman_ceiling(v) for k, v in result.gold.items()
+                        },
+                        "snapped_metrics": {
+                            k: asdict(v) | {"sigma_ratio": v.sigma_ratio}
+                            for k, v in snapped_metrics.items()
                         },
                         "predictions": {k: v.tolist() for k, v in result.predictions.items()},
                         "gold": {k: v.tolist() for k, v in result.gold.items()},

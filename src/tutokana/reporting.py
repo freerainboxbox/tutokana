@@ -194,3 +194,82 @@ def wandb_metrics(results: dict[str, FieldMetrics], prefix: str = "eval") -> dic
         flat[f"{prefix}/mse/{key}"] = m.mse
         flat[f"{prefix}/sigma_ratio/{key}"] = m.sigma_ratio
     return flat
+
+
+#: Above this share of labels below the maximum, "detect the imperfect ones" stops being a
+#: detection problem — everything is imperfect, and F1 is maximised by saying so.
+CEILING_MAJORITY = 0.5
+
+
+def render_detection(results: dict, ceilings: dict[str, float] | None = None) -> str:
+    """Detection of imperfect labels, plus how much of the achievable SCC is being reached.
+
+    Spearman on this corpus is a detection metric wearing a rank correlation's clothes: on
+    the test split, perfect ceiling-vs-not detection with random ordering below reaches 0.671
+    of the 0.680 achievable on phone accuracy, and perfect ordering without detection reaches
+    0.077. Reporting detection directly saves inferring it from SCC, and the ceiling column
+    says how much of the rank correlation was ever available — word accuracy caps at 0.528
+    for any continuous predictor simply because 90% of its labels are tied at 10.
+    """
+    header = (
+        f"{'field':<24}{'imperfect':>11}{'base rate':>11}{'AUC':>8}{'F1':>8}"
+        f"{'prec':>8}{'recall':>8}{'thresh':>9}"
+    )
+    if ceilings:
+        header += f"{'SCC':>8}{'ceiling':>9}{'of ceiling':>12}"
+    lines = ["=== detection: is this label below the maximum? ===", header, "-" * len(header)]
+    skipped = []
+    for level, field in REPORT_FIELDS:
+        key = f"{level}.{field}"
+        d = results.get(key)
+        if d is None:
+            continue
+        # The framing only holds where the ceiling is the majority class. Utterance scores
+        # run 2-10 with no dominant value, so "below the maximum" is 95-99% of them and F1
+        # reaches 0.999 by calling everything positive — a number that means nothing. Those
+        # fields have no ceiling problem to begin with: their SCC already tracks their PCC.
+        if d.share == d.share and d.share > CEILING_MAJORITY:
+            skipped.append(f"{key} ({d.share:.0%})")
+            continue
+        row = (
+            f"{key:<24}{d.positives:>11}{d.share:>10.2%}{_fmt(d.auc, '8.3f')}"
+            f"{_fmt(d.f1, '8.3f')}{_fmt(d.precision, '8.3f')}{_fmt(d.recall, '8.3f')}"
+            f"{_fmt(d.threshold, '9.3f')}"
+        )
+        if ceilings and key in ceilings:
+            scc, ceiling = ceilings[key]
+            share = 100 * scc / ceiling if ceiling and ceiling == ceiling else float("nan")
+            row += f"{_fmt(scc, '8.3f')}{_fmt(ceiling, '9.3f')}{_fmt(share, '11.0f')}%"
+        lines.append(row)
+    if skipped:
+        lines.append(
+            "  (no dominant ceiling, detection not meaningful: " + ", ".join(skipped) + ")"
+        )
+    return "\n".join(lines)
+
+
+def render_snapping(raw: dict[str, FieldMetrics], snapped: dict[str, FieldMetrics]) -> str:
+    """What rounding predictions onto the training label grid is worth.
+
+    Gold is quantised and a continuous readout is not, so a rank correlation compares a
+    strict ordering against one that is mostly a single tied block. Snapping restores those
+    ties and removes error below half a grid step. It is a change of scale applied after the
+    fact, not a change of model, and it cannot invent ordering the predictions lacked.
+    """
+    header = (
+        f"{'field':<24}{'PCC raw':>10}{'PCC snap':>10}{'delta':>9}"
+        f"{'SCC raw':>10}{'SCC snap':>10}{'delta':>9}"
+    )
+    lines = ["=== snapped to the training label grid ===", header, "-" * len(header)]
+    for level, field in REPORT_FIELDS:
+        key = f"{level}.{field}"
+        a, b = raw.get(key), snapped.get(key)
+        if a is None or b is None:
+            continue
+        lines.append(
+            f"{key:<24}{_fmt(a.pearson, '10.3f')}{_fmt(b.pearson, '10.3f')}"
+            f"{_fmt(b.pearson - a.pearson, '+9.3f')}"
+            f"{_fmt(a.spearman, '10.3f')}{_fmt(b.spearman, '10.3f')}"
+            f"{_fmt(b.spearman - a.spearman, '+9.3f')}"
+        )
+    return "\n".join(lines)

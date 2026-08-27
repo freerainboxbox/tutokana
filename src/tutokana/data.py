@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
 import numpy as np
@@ -204,10 +204,17 @@ def speaker_split(
 
 @dataclass(frozen=True, slots=True)
 class TargetStats:
-    """Per-field mean and standard deviation, keyed "<level>.<field>"."""
+    """Per-field mean, standard deviation and label support, keyed "<level>.<field>".
+
+    The support is the set of values the training labels actually take — 11 for phone
+    accuracy (0.0 to 2.0 in steps of 0.2), integers for the 0-10 fields. It is persisted
+    because snapping predictions back onto it at eval must use the *training* grid, and
+    because deriving it from the split under evaluation would be reading its labels.
+    """
 
     mean: dict[str, float]
     std: dict[str, float]
+    support: dict[str, list[float]] = dc_field(default_factory=dict)
 
     @staticmethod
     def key(level: str, field: str) -> str:
@@ -222,12 +229,16 @@ class TargetStats:
         return value * self.std[k] + self.mean[k]
 
     def save(self, path: Path) -> None:
-        path.write_text(json.dumps({"mean": self.mean, "std": self.std}, indent=2))
+        path.write_text(json.dumps(
+            {"mean": self.mean, "std": self.std, "support": self.support}, indent=2
+        ))
 
     @classmethod
     def load(cls, path: Path) -> "TargetStats":
+        # `support` is absent from runs trained before it was recorded; an empty mapping
+        # means "no grid known", which callers treat as "do not snap" rather than guessing.
         blob = json.loads(Path(path).read_text())
-        return cls(mean=blob["mean"], std=blob["std"])
+        return cls(mean=blob["mean"], std=blob["std"], support=blob.get("support", {}))
 
 
 def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
@@ -247,7 +258,7 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
             for a in w.phone_accuracy:
                 add("phone", "accuracy", a)
 
-    mean, std, degenerate = {}, {}, []
+    mean, std, support, degenerate = {}, {}, {}, []
     for key, values in pools.items():
         level, field = key.split(".", 1)
         arr = np.asarray(values, dtype=np.float64)
@@ -255,6 +266,7 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
         floor = MIN_STD_FRACTION * (high - low)
         mean[key] = float(arr.mean())
         std[key] = float(max(arr.std(), floor))
+        support[key] = sorted(float(v) for v in np.unique(arr))
         if arr.std() < floor:
             degenerate.append(f"{key} (sd {arr.std():.4g} < {floor:.4g})")
     if degenerate:
@@ -266,7 +278,7 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
             + ", ".join(degenerate),
             stacklevel=2,
         )
-    return TargetStats(mean=mean, std=std)
+    return TargetStats(mean=mean, std=std, support=support)
 
 
 def phone_vocabulary(utterances: list[Utterance]) -> tuple[str, ...]:
