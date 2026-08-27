@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Run artefacts. Trained adapters and heads are small enough to keep — that is the point of
+# only training LoRA plus heads — but intermediate checkpoints are not worth the history.
+runs/*/checkpoint-*/
+runs/*/*.partial.log
+
+# wandb's local mirror; the run directories and logs/ already hold everything reproducible.
+wandb/
+
+# macOS
+.DS_Store
+
+# Keep the directories, not their contents
+!runs/.gitkeep
+!logs/.gitkeep
