@@ -139,10 +139,19 @@ class LossConfig:
 
     `level_weights` multiply each level's element-count-normalised loss. `lambda_ccc`
     weights the correlation term; 0 disables it, which is the ablation arm that isolates
-    whether the pointwise loss alone is enough. `reweight_levels` names the levels whose
-    pointwise loss is reweighted by inverse label frequency; `word.stress` is always
-    reweighted regardless, because at 99:1 there is no sane configuration in which an
-    unbalanced stress head is the intended experiment.
+    whether the pointwise loss alone is enough.
+
+    `reweight_levels` names the levels whose pointwise loss is reweighted by inverse label
+    frequency. It defaults to phone alone, because reweighting answers a classification
+    question — "this decision boundary sees too few examples of that class" — and only the
+    phone head is a classifier. On a `regression` head, a label weight multiplies a log-cosh
+    *residual*, which does not rebalance anything; it just declares that being wrong about a
+    rare label costs more, and the rarest labels are also the noisiest. `--reweight-levels
+    phone,word` restores the previous behaviour as an ablation.
+
+    `word.stress` is reweighted regardless of this setting: it is a `binary` head at a 99:1
+    split, and there is no sane configuration in which an unbalanced stress head is the
+    intended experiment.
     """
 
     level_weights: dict[str, float] = field(
@@ -152,12 +161,12 @@ class LossConfig:
     lambda_lm: float = 0.5
     buffer_capacity: int = 512
     label_smoothing: float = 0.05
-    reweight_levels: tuple[str, ...] = ("phone", "word")
+    reweight_levels: tuple[str, ...] = ("phone",)
     reweight_strength: float = 1.0
-    #: Largest weight any single label may carry. Uncapped inverse frequency is indefensible
-    #: on this corpus: word accuracy 9 occurs 3 times in 15849 words and would earn a 476x
-    #: multiplier, so one word in one micro-batch outweighs several hundred ordinary ones.
-    #: That is what turned the loss into a 10-148 sawtooth rather than a curve.
+    #: Largest ratio between any two label weights, applied before the mean-1 pass. Uncapped
+    #: inverse frequency is indefensible on this corpus: word accuracy 9 occurs 3 times in
+    #: 15849 words and spans a 4176x range, so one word in one micro-batch outweighs several
+    #: hundred ordinary ones. That is what turned the loss into a 10-148 sawtooth.
     reweight_max: float = 10.0
 
 

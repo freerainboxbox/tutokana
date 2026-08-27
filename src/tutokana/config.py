@@ -93,7 +93,7 @@ class Config:
     buffer_capacity: int = 512
     reweight_strength: float = 1.0
     reweight_max: float = 10.0
-    reweight_levels: tuple[str, ...] = ("phone", "word")
+    reweight_levels: tuple[str, ...] = ("phone",)
     level_weight_phone: float = 1.0
     level_weight_word: float = 1.0
     level_weight_utterance: float = 1.0

@@ -167,26 +167,49 @@ behave differently per phone rather than only rescaling its output. A head per s
 deliberately not offered; anything else is rejected rather than silently degrading to `none`,
 which would make an ablation arm quietly measure nothing.
 
-**Class imbalance is handled by mean-1 inverse-frequency weights**, normalised under the
-training marginal so switching reweighting on does not implicitly change the effective
-learning rate. `word.stress` is always reweighted regardless of `--reweight-levels`: at 99:1
-there is no configuration in which an unbalanced stress head is the intended experiment.
+### Label reweighting
 
-Mean 1 is not enough on its own. These tails are extreme — word accuracy 9 occurs **3 times
-in 15849 words** — so raw inverse frequency spans a dynamic range of 4176x and a single word
-outweighs several hundred ordinary ones. `--reweight-max` (default 10) bounds that range
-before the mean-1 pass, which is the difference between a loss curve and a sawtooth:
+Rare labels are upweighted by inverse frequency, normalised to mean 1 under the training
+marginal so that enabling it does not implicitly change the effective learning rate.
 
-| field | uncapped max weight | dynamic range | capped (10x) |
+**Which heads get it: phone only, by default.** Reweighting answers a classification
+question — *this decision boundary sees too few examples of that class* — and only the phone
+head is a classifier. On a `regression` head a label weight multiplies a log-cosh
+**residual**, which rebalances nothing; it only declares that being wrong about a rare label
+costs more, and on this corpus the rarest labels are also the noisiest (word accuracy 9
+occurs 3 times, and each score is a 5-annotator mean). So the default is
+`--reweight-levels phone`.
+
+Two things sit outside that default:
+
+- **`word.stress` is always reweighted**, whatever `--reweight-levels` says. It is a `binary`
+  head at a 99:1 split — a detection problem, not a regression one — and there is no sane
+  configuration in which an unbalanced stress head is the intended experiment.
+- **`--reweight-levels phone,word`** restores the previous behaviour, as an ablation.
+
+**How much: the ratio is capped.** Mean 1 constrains the average and leaves the tail free,
+which is not enough — these tails are extreme. Raw inverse frequency spans a **4176×**
+dynamic range on word accuracy, so one word in one micro-batch outweighs several hundred
+ordinary ones. That is the difference between a loss curve and a sawtooth: the run that
+exposed this oscillated between 10 and 148 around a median of 50, against a preflight loss
+of 15.
+
+| field | uncapped max weight | uncapped range | capped max (10×) |
 |---|---|---|---|
 | phone.accuracy | 92.0 | 810 | 3.58 |
 | word.accuracy | 475.9 | 4176 | 4.76 |
 | word.total | 132.2 | 1026 | 4.46 |
 | word.stress | 50.3 | 100 | 9.18 |
 
-The cap is on the *ratio*, applied before normalising — clamping afterwards does not work,
-because restoring mean 1 scales the clamped values back above the ceiling. Labels rarer than
-the ceiling allows tie there, which is the intended behaviour.
+`--reweight-max` (default 10) bounds the **ratio** between the largest and smallest weight,
+and is applied *before* the mean-1 pass. Order matters: clamping afterwards does not hold,
+because restoring mean 1 scales the clamped values straight back above the ceiling. Labels
+rarer than the ceiling allows tie there, which is intended — beyond that point the
+distinction is between noise and noise.
+
+`--reweight-strength` is the exponent: 0 is uniform, 1 is full inverse frequency.
+`--reweight-max 0` disables the cap, which is only useful for reproducing a run that predates
+it.
 
 ### Objective
 
@@ -331,6 +354,7 @@ Each is a flag, not a rewrite.
 | regression or an expectation over the discrete support? | `--head-modes-phone regression` |
 | does reading lower layers help the fine levels? | `--no-layer-mixture` |
 | is per-phone conditioning worth it, and how rich? | `--phone-conditioning none` / `concat` |
+| does reweighting the regression heads help or hurt? | `--reweight-levels phone,word` |
 | does opening the audio front end help? | `--train-audio-projection` |
 
 The first is the most interesting: published work on both Qwen2-Audio and GPT-4o found that

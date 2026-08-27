@@ -166,3 +166,23 @@ def test_build_reweighter_passes_the_cap_through(utterances):
     reweighter = build_reweighter(utterances, LossConfig(reweight_max=3.0))
     for key in reweighter.tables:
         assert _dynamic_range(reweighter, key) <= 3.0 + 1e-4
+
+
+def test_only_the_phone_head_is_reweighted_by_default(utterances):
+    """Reweighting is a classification device; only the phone head is a classifier.
+
+    On a regression head a label weight scales a log-cosh residual, which rebalances nothing.
+    `word.stress` is the exception — a binary head at 99:1 — and is always included.
+    """
+    reweighter = build_reweighter(utterances, LossConfig())
+    assert set(reweighter.tables) == {"phone.accuracy", "word.stress"}
+
+
+def test_word_level_reweighting_is_available_as_an_ablation(utterances):
+    reweighter = build_reweighter(utterances, LossConfig(reweight_levels=("phone", "word")))
+    assert {"word.accuracy", "word.total"} <= set(reweighter.tables)
+
+
+def test_disabling_every_level_still_reweights_stress(utterances):
+    reweighter = build_reweighter(utterances, LossConfig(reweight_levels=()))
+    assert set(reweighter.tables) == {"word.stress"}
