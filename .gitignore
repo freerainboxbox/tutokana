@@ -5,12 +5,19 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Run artefacts. Trained adapters and heads are small enough to keep — that is the point of
-# only training LoRA plus heads — but intermediate checkpoints are not worth the history.
+# Model weights and optimizer state. runs/ is a working directory, not an artefact store: a
+# single run carries a ~63 MB head bundle, a LoRA adapter, and ~1.2 GB of AdamW moments, and
+# none of that belongs in git history. The small JSON beside them — config.json,
+# target_stats.json, resume.json — is the run's reproducible record, so that stays tracked.
+runs/**/*.safetensors
+runs/**/*.pt
+runs/**/*.pth
+runs/**/*.bin
+runs/**/adapter/
 runs/*/checkpoint-*/
 runs/*/*.partial.log
 
-# wandb's local mirror; the run directories and logs/ already hold everything reproducible.
+# wandb's local mirror; logs/ and the run JSON already hold everything reproducible.
 wandb/
 
 # macOS
