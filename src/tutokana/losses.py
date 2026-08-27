@@ -108,6 +108,20 @@ class CorrelationBuffer:
         self._predictions.clear()
         self._targets.clear()
 
+    def state_dict(self) -> dict:
+        """Saved across a resume: a cold buffer would leave the correlation term estimating
+        its moments from a handful of points for the first few hundred steps."""
+        return {
+            "capacity": self.capacity,
+            "predictions": {k: v.cpu() for k, v in self._predictions.items()},
+            "targets": {k: v.cpu() for k, v in self._targets.items()},
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.capacity = state["capacity"]
+        self._predictions = dict(state["predictions"])
+        self._targets = dict(state["targets"])
+
 
 @dataclass
 class LossConfig:

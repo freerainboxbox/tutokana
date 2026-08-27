@@ -48,8 +48,13 @@ class DataConfig:
 class TrainConfig:
     seed: int = 3407
     epochs: int = 2
-    batch_size: int = 4
-    grad_accum: int = 4
+    # `grad_accum` counts micro-batches per optimizer step, so the effective batch is
+    # batch_size * grad_accum = 4. Activation memory is set by `batch_size` alone; raising
+    # `grad_accum` costs time, not memory. The correlation term does not need a large batch
+    # — that is what losses.CorrelationBuffer is for — so 2 x 2 is a memory-driven default,
+    # not a compromise on the objective.
+    batch_size: int = 2
+    grad_accum: int = 2
     learning_rate: float = 1e-4
     head_learning_rate: float = 1e-3
     weight_decay: float = 0.01
@@ -105,6 +110,27 @@ class Config:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def diff(self, other: "Config") -> list[tuple[str, object, object]]:
+        """(field path, mine, theirs) for every field that disagrees, nested included.
+
+        A resumed run reconstructs its mix, splits and schedule from the saved config, so a
+        conflicting flag cannot be honoured — but it must be named rather than dropped
+        silently, which is how the predecessor's resumed runs quietly drifted.
+        """
+
+        def walk(a, b, prefix=""):
+            found = []
+            for f in fields(a):
+                mine, theirs = getattr(a, f.name), getattr(b, f.name)
+                path = f"{prefix}{f.name}"
+                if is_dataclass(mine):
+                    found.extend(walk(mine, theirs, f"{path}."))
+                elif mine != theirs:
+                    found.append((path, mine, theirs))
+            return found
+
+        return walk(self, other)
 
     @classmethod
     def from_dict(cls, blob: dict) -> "Config":

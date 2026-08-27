@@ -191,9 +191,17 @@ Pearson is invariant to both variance shrinkage and mean shift, i.e. invariant t
 failure being corrected. CCC penalises both.
 
 A correlation needs a population and one batch is not one — utterance-level CCC over a batch
-of 8 is noise. `CorrelationBuffer` keeps a detached FIFO of the last 512 (prediction, target)
+of 4 is noise. `CorrelationBuffer` keeps a detached FIFO of the last 512 (prediction, target)
 pairs per head and computes the statistic over `live batch ∪ buffer`. Gradient flows only
-through the live batch; the moments are estimated on hundreds of points.
+through the live batch; the moments are estimated on hundreds of points. This is what lets
+the batch size be chosen for memory rather than for the objective.
+
+### Batching
+
+`--train-batch-size` is the micro-batch; `--train-grad-accum` is how many of those are
+accumulated per optimizer step. Effective batch is their product, 2 × 2 = 4 by default.
+Activation memory is set by the micro-batch alone, so `grad_accum` buys a larger effective
+batch for time rather than memory.
 
 Language-model cross-entropy covers the transcript text only. It is masked off the registers
 (nothing to learn there, and it would compete with the heads) and off the audio positions.

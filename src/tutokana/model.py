@@ -217,8 +217,14 @@ def build_model(
     register_ids: dict[str, int],
     device: torch.device,
     adapter_dir: Path | None = None,
+    trainable_adapter: bool = False,
 ) -> TutokanaModel:
-    """Load the base model, attach LoRA (or a saved adapter), heads and register delta."""
+    """Load the base model, attach LoRA (or a saved adapter), heads and register delta.
+
+    `trainable_adapter` matters when reloading: an adapter loaded for evaluation is frozen,
+    but one loaded to continue training must not be, or the resumed run would silently
+    optimise nothing but the heads.
+    """
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
 
@@ -230,7 +236,9 @@ def build_model(
     )
 
     if adapter_dir is not None:
-        base = PeftModel.from_pretrained(base, str(adapter_dir), is_trainable=False)
+        base = PeftModel.from_pretrained(
+            base, str(adapter_dir), is_trainable=trainable_adapter
+        )
     else:
         base = get_peft_model(
             base,

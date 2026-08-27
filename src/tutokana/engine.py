@@ -21,12 +21,14 @@ never touched here.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import signal
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -247,3 +249,80 @@ def build_scheduler(optimizer, total_steps: int, warmup_ratio: float):
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+# --- interruption and resume ----------------------------------------------------------
+# Interrupting is only half of it. A resume is *clean* when continuing produces the same
+# trajectory the uninterrupted run would have had, which needs more than the weights:
+# optimizer moments, the schedule position, the random streams that drive shuffling and
+# dropout, the correlation buffer's population, and where in the epoch the run stopped.
+# Everything else — the training mix, the speaker split, the epoch orders, the target
+# statistics — is a deterministic function of the saved config, so it is recomputed rather
+# than stored.
+
+RESUME_META = "resume.json"
+RESUME_STATE = "resume_state.pt"
+
+
+def rng_state() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].to(torch.uint8).cpu())
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_resume(
+    run_dir,
+    *,
+    meta: dict,
+    optimizer,
+    scheduler,
+    buffer,
+) -> None:
+    """Write everything needed to continue, alongside the adapter and heads.
+
+    Called both on interrupt and at every periodic checkpoint, so an ordinary crash or a
+    killed job resumes from the last checkpoint rather than from nothing.
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "rng": rng_state(),
+            "buffer": buffer.state_dict() if buffer is not None else None,
+        },
+        run_dir / RESUME_STATE,
+    )
+    (run_dir / RESUME_META).write_text(json.dumps(meta, indent=2, default=str))
+
+
+def load_resume(run_dir) -> tuple[dict, dict]:
+    """(metadata, tensors) for a run that was interrupted. Raises if it was not."""
+    run_dir = Path(run_dir)
+    meta_path = run_dir / RESUME_META
+    if not meta_path.exists():
+        raise SystemExit(
+            f"{run_dir} has no {RESUME_META} — it either finished cleanly or never "
+            f"reached its first checkpoint, so there is nothing to resume."
+        )
+    meta = json.loads(meta_path.read_text())
+    state = torch.load(run_dir / RESUME_STATE, map_location="cpu", weights_only=False)
+    return meta, state
+
+
+def clear_resume(run_dir) -> None:
+    """Drop the resume bundle once a run finishes, so it cannot leak into a later one."""
+    for name in (RESUME_META, RESUME_STATE):
+        (Path(run_dir) / name).unlink(missing_ok=True)
