@@ -186,3 +186,100 @@ def test_word_level_reweighting_is_available_as_an_ablation(utterances):
 def test_disabling_every_level_still_reweights_stress(utterances):
     reweighter = build_reweighter(utterances, LossConfig(reweight_levels=()))
     assert set(reweighter.tables) == {"word.stress"}
+
+
+# --- detection auxiliary -------------------------------------------------------------------
+
+
+def _soft_class_head(support=(0.0, 0.5, 1.0, 1.5, 2.0)):
+    from tutokana.heads import ScoreHead
+
+    return ScoreHead(hidden_size=8, mode="soft_class", support=support)
+
+
+def test_detection_logit_is_the_odds_of_not_being_at_the_ceiling():
+    """Read off the existing logits: log(1 - p_top) - log(p_top). No new parameters."""
+    from tutokana.losses import detection_logit
+
+    head = _soft_class_head()
+    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 2.0]])
+    probs = torch.softmax(logits, dim=-1)
+    expected = torch.log(1 - probs[..., 4]) - torch.log(probs[..., 4])
+    torch.testing.assert_close(detection_logit(head, logits), expected, atol=1e-5, rtol=1e-5)
+
+
+def test_detection_logit_finds_the_ceiling_by_value_not_by_index():
+    """The top class is the largest *support value*, which need not be the last column."""
+    from tutokana.losses import detection_logit
+
+    head = _soft_class_head(support=(2.0, 0.0, 1.0))
+    logits = torch.tensor([[5.0, 0.0, 0.0]])           # mass on index 0, the value 2.0
+    assert float(detection_logit(head, logits)) < 0    # confident it IS at the ceiling
+
+
+def test_detection_logit_is_none_for_heads_without_a_distribution():
+    """Regression and binary heads have nothing to read; the term skips them silently."""
+    from tutokana.heads import ScoreHead
+    from tutokana.losses import detection_logit
+
+    assert detection_logit(ScoreHead(8, mode="regression"), torch.zeros(2, 1)) is None
+    assert detection_logit(ScoreHead(8, mode="binary"), torch.zeros(2, 1)) is None
+
+
+def test_detection_separates_cases_the_expectation_readout_conflates():
+    """Why this is worth adding at all.
+
+    An expectation readout maps "confidently 1.5" and "unsure between 1.0 and 2.0" to nearly
+    the same number, though only the second should look suspicious. The detection logit
+    tells them apart, which is what a rank correlation is actually rewarding here.
+    """
+    from tutokana.losses import detection_logit
+
+    head = _soft_class_head()
+    confident = torch.tensor([[0.0, 0.0, 0.0, 9.0, 0.0]])       # all mass on 1.5
+    unsure = torch.tensor([[0.0, 0.0, 4.0, 0.0, 4.0]])          # split between 1.0 and 2.0
+    readout = head.predict_native(torch.cat([confident, unsure]))
+    assert abs(float(readout[0]) - float(readout[1])) < 0.1     # readout barely differs
+    assert detection_logit(head, confident) > detection_logit(head, unsure) + 1.0
+
+
+def test_pos_weight_raises_the_cost_of_missing_a_mispronunciation():
+    """The base rate is 19% for phone and 10% for word; an unweighted term lets the
+    majority dominate."""
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import detection_loss
+
+    head = _soft_class_head()
+    logits = torch.tensor([[9.0, 0.0, 0.0, 0.0, 0.0]])          # says "imperfect"
+    batch = HeadBatch(
+        positions=torch.zeros(1, 2, dtype=torch.long), target=torch.zeros(1),
+        raw=torch.tensor([2.0]),                                 # ...but it is at the ceiling
+    )
+    plain = detection_loss(head, logits, batch, LossConfig(lambda_detect=1.0))
+    weighted = detection_loss(
+        head, logits, batch, LossConfig(lambda_detect=1.0, detect_pos_weight=10.0)
+    )
+    # This example is a false alarm, not a miss, so pos_weight must NOT inflate it.
+    torch.testing.assert_close(plain, weighted)
+
+
+def test_detection_term_is_off_by_default_and_added_when_enabled(utterances):
+    """It is an experiment arm, so the control is the existing default."""
+    from tutokana.collate import HeadBatch
+    from tutokana.data import compute_target_stats
+    from tutokana.heads import HeadBank, build_head_specs
+    from tutokana.losses import composite_loss
+
+    stats = compute_target_stats(utterances[:4])
+    specs = build_head_specs(("phone",), {"phone": "soft_class"}, 5, "none", stats)
+    bank = HeadBank(8, specs, ("phone",), n_layers=1)
+    logits = {"phone.accuracy": torch.randn(6, len(bank.head("phone.accuracy").support))}
+    heads = {"phone.accuracy": HeadBatch(
+        positions=torch.zeros(6, 2, dtype=torch.long), target=torch.randn(6),
+        raw=torch.tensor([2.0, 2.0, 1.6, 2.0, 0.4, 2.0]))}
+
+    _, off = composite_loss(bank, logits, heads, LossConfig())
+    _, on = composite_loss(bank, logits, heads, LossConfig(lambda_detect=0.5))
+    assert "detect/phone.accuracy" not in off
+    assert "detect/phone.accuracy" in on
+    assert on["loss/total"] > off["loss/total"]

@@ -231,6 +231,8 @@ def main() -> None:
             reweight_levels=tuple(config.reweight_levels),
             reweight_strength=config.reweight_strength,
             reweight_max=config.reweight_max,
+            lambda_detect=config.lambda_detect,
+            detect_pos_weight=config.detect_pos_weight,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
         buffer = CorrelationBuffer(loss_config.buffer_capacity)

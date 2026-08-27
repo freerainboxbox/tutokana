@@ -168,6 +168,17 @@ class LossConfig:
     #: 15849 words and spans a 4176x range, so one word in one micro-batch outweighs several
     #: hundred ordinary ones. That is what turned the loss into a 10-148 sawtooth.
     reweight_max: float = 10.0
+    #: Weight on the auxiliary "is this label below the ceiling?" term. 0 disables it.
+    #:
+    #: Decomposing the achievable Spearman on the test split shows perfect ceiling-vs-not
+    #: detection reaching 0.671 of the 0.680 available on phone accuracy, and perfect
+    #: ordering below the ceiling reaching 0.077. The rank correlation is a detection metric
+    #: in disguise, and nothing in the objective was optimising detection directly: the
+    #: multi-class cross-entropy spends most of its mass separating 1.8 from 2.0.
+    lambda_detect: float = 0.0
+    #: Weight on the positive (imperfect) class in that term. The base rate is 19% for phone
+    #: accuracy and 10% for word accuracy, so 1.0 lets the majority dominate.
+    detect_pos_weight: float = 1.0
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.
@@ -218,6 +229,37 @@ class LabelReweighter:
         support = raw.new_tensor(values)
         index = (raw.unsqueeze(-1) - support).abs().argmin(dim=-1)
         return weights.to(raw.device)[index]
+
+
+def detection_logit(head, logits: torch.Tensor) -> torch.Tensor | None:
+    """Log-odds that this label is *below* the head's ceiling, from the existing logits.
+
+    A `soft_class` head already carries the answer: `log(1 - p_top) - log(p_top)` is exactly
+    the logit of "not at the top class", and computing it as a logsumexp difference keeps it
+    stable without ever materialising a probability. Zero new parameters — the readout was
+    throwing this away by collapsing the distribution to its expectation, which conflates
+    "confidently 1.6" with "unsure between 1.0 and 2.0" though only the second is suspicious.
+
+    Returns None for heads with no distribution to read (`regression`, `binary`).
+    """
+    if head.mode != "soft_class" or head.support.numel() == 0:
+        return None
+    top = int(torch.argmax(head.support))
+    others = [i for i in range(logits.shape[-1]) if i != top]
+    if not others:
+        return None
+    return torch.logsumexp(logits[..., others], dim=-1) - logits[..., top]
+
+
+def detection_loss(head, logits: torch.Tensor, batch, config: LossConfig) -> torch.Tensor | None:
+    """Binary cross-entropy on "below the ceiling", or None if the head cannot express it."""
+    logit = detection_logit(head, logits)
+    if logit is None:
+        return None
+    ceiling = float(head.support.max())
+    target = (batch.raw < ceiling).to(logit.dtype)
+    weight = logit.new_tensor(config.detect_pos_weight)
+    return F.binary_cross_entropy_with_logits(logit, target, pos_weight=weight)
 
 
 def head_loss(
@@ -285,6 +327,12 @@ def composite_loss(
         pointwise, normalized = head_loss(head, logits, batch, config, sample_weight)
         term = pointwise
         parts[f"loss/{key}"] = float(pointwise.detach())
+
+        if config.lambda_detect > 0.0:
+            detection = detection_loss(head, logits, batch, config)
+            if detection is not None:
+                term = term + config.lambda_detect * detection
+                parts[f"detect/{key}"] = float(detection.detach())
 
         if config.lambda_ccc > 0.0:
             if buffer is not None:

@@ -416,6 +416,7 @@ Each is a flag, not a rewrite.
 | does reading lower layers help the fine levels? | `--no-layer-mixture` |
 | is per-phone conditioning worth it, and how rich? | `--phone-conditioning none` / `concat` |
 | does reweighting the regression heads help or hurt? | `--reweight-levels phone,word` |
+| does optimising detection directly lift the rank correlation? | `--lambda-detect 0.5` |
 | does opening the audio front end help? | `--train-audio-projection` |
 
 The first is the most interesting: published work on both Qwen2-Audio and GPT-4o found that
