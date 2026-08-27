@@ -192,3 +192,44 @@ def test_trained_parts_round_trip(wired, tmp_path):
     original = model.heads.state_dict()
     for key, value in reloaded.heads.state_dict().items():
         assert torch.allclose(value, original[key]), key
+
+
+def test_scoring_skips_the_language_model_loss(wired):
+    """The memory fix. Asking for `labels` materialises logits over the whole vocabulary —
+    5.5 GB in fp32 at batch 8, sequence 700, scaling linearly with both — and scoring throws
+    that loss away. It was the largest allocation in an eval pass and existed to be discarded.
+    """
+    model, collator, sample = wired
+    batch = move_batch(collator(sample[:2]), CPU)
+    model.eval()
+    with torch.no_grad():
+        trained_heads, lm_loss = model(batch, with_lm_loss=True)
+        scored_heads, no_loss = model(batch, with_lm_loss=False)
+
+    assert lm_loss is not None, "training still needs the text objective"
+    assert no_loss is None, "scoring must not compute a loss it discards"
+
+    # Skipping the loss must not change a single prediction: the heads read hidden states,
+    # which do not depend on `labels`.
+    assert trained_heads.keys() == scored_heads.keys()
+    for key in trained_heads:
+        torch.testing.assert_close(trained_heads[key], scored_heads[key])
+
+
+def test_score_reports_how_much_it_scored(wired):
+    """`scored`/`partial` let an interrupted eval label its own table honestly."""
+    model, collator, sample = wired
+    result = score(model, collator, sample, CPU, batch_size=2, bootstrap=False)
+    assert result.scored == len(sample)
+    assert result.partial is False
+
+
+def test_score_stops_early_and_returns_what_it_has(wired):
+    """Ctrl-C during a long eval should yield a partial table, not lose everything."""
+    model, collator, sample = wired
+    tripped = {"requested": True}  # as if the signal arrived before the first batch finished
+    result = score(model, collator, sample, CPU, batch_size=1, bootstrap=False,
+                   interrupt=tripped)
+    assert result.partial is True
+    assert 0 < result.scored < len(sample)
+    assert result.metrics, "a partial pass must still produce metrics"

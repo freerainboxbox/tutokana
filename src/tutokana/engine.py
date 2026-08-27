@@ -37,6 +37,7 @@ from .config import get_logger
 from .data import Utterance, from_binary_stress
 from .losses import LossConfig, composite_loss
 from .metrics import FieldMetrics, field_metrics
+from .progress import Progress, memory_note
 
 logger = get_logger()
 
@@ -161,6 +162,9 @@ class ScoreResult:
     metrics: dict[str, FieldMetrics]
     predictions: dict[str, np.ndarray]
     gold: dict[str, np.ndarray]
+    #: Utterances actually scored, which is fewer than asked for after an interrupt.
+    scored: int = 0
+    partial: bool = False
 
 
 @torch.no_grad()
@@ -171,7 +175,8 @@ def score(
     device,
     batch_size: int = 8,
     bootstrap: bool = True,
-    progress_every: int = 0,
+    progress: "Progress | None" = None,
+    interrupt: dict | None = None,
 ) -> ScoreResult:
     """Teacher-forced scoring: one forward pass per batch, every head read at once.
 
@@ -179,14 +184,23 @@ def score(
     with its gold score. Letting the model generate the phone sequence here would leave a
     few percent of positions misaligned and make the phone correlation incomparable to the
     published baselines — the generative capability is measured separately.
+
+    `with_lm_loss=False` is the memory fix: scoring discards the text loss, but asking for it
+    materialises logits over the full vocabulary, which was the largest allocation in the
+    pass and grew with sequence length.
+
+    `interrupt` is a `graceful_interrupt` flag. When it trips, scoring stops at the current
+    batch and returns what it has, marked `partial` — a correlation over 1800 of 2500
+    utterances is still worth reading, and losing it to a KeyboardInterrupt is not.
     """
     model.eval()
     collected: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
-    started = time.time()
+    scored = 0
+    stopped = False
 
-    for done, chunk in enumerate(batches(utterances, batch_size), 1):
+    for chunk in batches(utterances, batch_size):
         batch = move_batch(collator(chunk), device)
-        head_outputs, _ = model(batch)
+        head_outputs, _ = model(batch, with_lm_loss=False)
         for key, logits in head_outputs.items():
             head = model.heads.head(key)
             prediction = head.predict_native(logits).float().cpu().numpy()
@@ -197,10 +211,12 @@ def score(
                 prediction = np.vectorize(from_binary_stress)(prediction)
                 gold = np.vectorize(from_binary_stress)(gold)
             collected.setdefault(key, []).append((prediction, gold))
-        if progress_every and done % progress_every == 0:
-            seen = done * batch_size
-            rate = seen / max(time.time() - started, 1e-6)
-            logger.info("[score] %d/%d utterances (%.1f/s)", seen, len(utterances), rate)
+        scored += len(chunk)
+        if progress is not None:
+            progress.update(len(chunk), detail=memory_note(device))
+        if interrupt is not None and interrupt.get("requested"):
+            stopped = True
+            break
 
     predictions = {k: np.concatenate([p for p, _ in v]) for k, v in collected.items()}
     gold = {k: np.concatenate([g for _, g in v]) for k, v in collected.items()}
@@ -208,7 +224,10 @@ def score(
         key: field_metrics(predictions[key], gold[key], bootstrap=bootstrap)
         for key in predictions
     }
-    return ScoreResult(metrics=metrics, predictions=predictions, gold=gold)
+    return ScoreResult(
+        metrics=metrics, predictions=predictions, gold=gold,
+        scored=scored, partial=stopped,
+    )
 
 
 def summarize(metrics: dict[str, FieldMetrics]) -> str:

@@ -74,6 +74,7 @@ from tutokana.model import (
     save_run_metadata,
 )
 from tutokana.prompting import TargetSpec
+from tutokana.progress import Progress, memory_note
 from tutokana.reporting import wandb_metrics
 from tutokana.tokens import register_tokens
 
@@ -301,6 +302,8 @@ def main() -> None:
             }
 
         stopped = False
+        bar = Progress(total_steps, log, "train", every=config.train.log_every,
+                       unit="step", start_at=step)
         with graceful_interrupt() as interrupt:
             for epoch in range(start_epoch, config.train.epochs):
                 # Reconstructed, not stored: the order is a pure function of (seed, epoch),
@@ -313,7 +316,7 @@ def main() -> None:
                 if consumed:
                     log.info("[resume] skipping %d samples already seen this epoch", consumed)
                 model.train()
-                window_loss, window_start = 0.0, time.time()
+                window_loss, window_count = 0.0, 0
 
                 for micro, chunk in enumerate(
                     batches(shuffled[consumed:], config.train.batch_size)
@@ -326,6 +329,7 @@ def main() -> None:
                     )
                     (loss / config.train.grad_accum).backward()
                     window_loss += parts["loss/total"]
+                    window_count += 1
 
                     if (micro + 1) % config.train.grad_accum:
                         continue
@@ -339,23 +343,24 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
                     step += 1
 
+                    mean_loss = window_loss / max(window_count, 1)
+                    bar.update(
+                        1,
+                        suffix=f"  loss {mean_loss:.3f}",
+                        detail=f"epoch {epoch} loss {mean_loss:.4f} "
+                               f"lr {scheduler.get_last_lr()[0]:.2e} {memory_note(device)}",
+                    )
+
                     if step % config.train.log_every == 0:
-                        window = config.train.log_every * config.train.grad_accum
-                        rate = window / max(time.time() - window_start, 1e-6)
-                        log.info(
-                            "[train] epoch %d step %d/%d loss %.4f lr %.2e (%.2f batch/s)",
-                            epoch, step, total_steps, window_loss / window,
-                            scheduler.get_last_lr()[0], rate,
-                        )
                         if run is not None:
                             run.log({**parts, "train/step": step,
                                      "train/lr": scheduler.get_last_lr()[0]}, step=step)
-                        window_loss, window_start = 0.0, time.time()
+                        window_loss, window_count = 0.0, 0
 
                     if config.train.val_every and step % config.train.val_every == 0:
                         result = score(model, collator, val_subset, device,
                                        batch_size=config.train.batch_size, bootstrap=False)
-                        log.info("[val] step %d  %s", step, summarize(result.metrics))
+                        bar.write(f"[val] step {step}  {summarize(result.metrics)}")
                         if run is not None:
                             run.log(wandb_metrics(result.metrics, "val"), step=step)
                         model.train()
@@ -369,7 +374,7 @@ def main() -> None:
                             run_dir, meta=resume_snapshot(epoch, next_sample),
                             optimizer=optimizer, scheduler=scheduler, buffer=buffer,
                         )
-                        log.info("[save] checkpoint-%d (resumable)", step)
+                        bar.write(f"[save] checkpoint-{step} (resumable)")
 
                     if interrupt["requested"]:
                         model.save(run_dir)
@@ -377,16 +382,16 @@ def main() -> None:
                             run_dir, meta=resume_snapshot(epoch, next_sample),
                             optimizer=optimizer, scheduler=scheduler, buffer=buffer,
                         )
-                        log.info(
-                            "[save] interrupted at epoch %d sample %d step %d — "
-                            "continue with: python train.py --resume %s",
-                            epoch, next_sample, step, run_id,
+                        bar.write(
+                            f"[save] interrupted at epoch {epoch} sample {next_sample} "
+                            f"step {step} — continue with: python train.py --resume {run_id}"
                         )
                         stopped = True
                         break
                 if stopped:
                     break
 
+        bar.close()
         model.save(run_dir)
         stats.save(run_dir / "target_stats.json")
         if not stopped:

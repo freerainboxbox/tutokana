@@ -15,6 +15,10 @@ exact-match, which is where the generative capability is actually measured.
     python evaluate.py --split train --limit 200
     python evaluate.py --generative --generative-samples 200
 
+The console shows a progress bar with rate and ETA; the log file gets a timestamped detail
+line every ten utterances, including accelerator memory. Ctrl-C stops scoring at the current
+batch and reports the correlations over whatever was scored, labelled PARTIAL.
+
 The table is printed and written verbatim to `logs/eval-<run_id>-<timestamp>.log`.
 """
 
@@ -33,11 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from tutokana import config as cfg
 from tutokana.collate import Collator
 from tutokana.data import TargetStats, load_split, stratified_indices
-from tutokana.engine import score, seed_everything
+from tutokana.engine import graceful_interrupt, score, seed_everything
 from tutokana.heads import build_head_specs
 from tutokana.metrics import transcription_metrics
 from tutokana.model import ModelConfig, build_model, load_processor, resolve_device
 from tutokana.prompting import TargetSpec, parse_generated
+from tutokana.progress import Progress
 from tutokana.reporting import render_baselines, render_table, render_transcription
 from tutokana.tokens import register_tokens
 
@@ -54,7 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", default="", help="explicit path to a run directory")
     parser.add_argument("--split", default="test", help="dataset split (default: test)")
     parser.add_argument("--limit", type=int, default=0, help="evaluate only the first N utterances")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--batch-size", type=int, default=2,
+        help="utterances per forward pass. Memory scales with batch x sequence length, so "
+             "raise this only after watching the memory column in the log (default: 2)",
+    )
     parser.add_argument("--no-bootstrap", action="store_true", help="skip the correlation intervals")
     parser.add_argument("--generative", action="store_true",
                         help="also decode transcripts and report phone error rate")
@@ -161,14 +170,26 @@ def main() -> None:
         collator = Collator(
             processor, spec, stats, phones, max_length=config.data.max_length
         )
-        result = score(
-            model, collator, utterances, device,
-            batch_size=args.batch_size,
-            bootstrap=not args.no_bootstrap,
-            progress_every=25,
-        )
+        with graceful_interrupt() as interrupt:
+            with Progress(len(utterances), log, "score", every=10, unit="utt") as bar:
+                result = score(
+                    model, collator, utterances, device,
+                    batch_size=args.batch_size,
+                    bootstrap=not args.no_bootstrap,
+                    progress=bar,
+                    interrupt=interrupt,
+                )
+        if result.partial:
+            log.warning(
+                "[score] interrupted after %d/%d utterances — the table below is computed "
+                "on what was scored, not the full split",
+                result.scored, len(utterances),
+            )
 
-        table = render_table(result.metrics, title=f"{run_id} / {args.split}")
+        title = f"{run_id} / {args.split}"
+        if result.partial:
+            title += f" (PARTIAL: {result.scored}/{len(utterances)})"
+        table = render_table(result.metrics, title=title)
         comparison = render_baselines(result.metrics)
         for line in (table + "\n\n" + comparison).splitlines():
             log.info("%s", line)

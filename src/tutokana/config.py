@@ -240,6 +240,18 @@ def get_logger(name: str = "tutokana") -> logging.Logger:
     return logging.getLogger(name)
 
 
+class FileOnly(logging.Filter):
+    """Keeps `extra={"file_only": True}` records out of the console.
+
+    Progress detail belongs in the log, where it can be diffed and plotted, but on the
+    console it would scroll the live progress bar away several times a second. The bar and
+    the log line carry the same numbers to different audiences.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "file_only", False)
+
+
 @contextlib.contextmanager
 def run_logging(kind: str, run_id: str, log_dir: Path | None = None):
     """Console + file logging, with the file named for the completion time.
@@ -258,6 +270,7 @@ def run_logging(kind: str, run_id: str, log_dir: Path | None = None):
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
+    console.addFilter(FileOnly())
     file_handler = logging.FileHandler(partial, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(console)

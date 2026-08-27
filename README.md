@@ -235,6 +235,23 @@ pairs per head and computes the statistic over `live batch ∪ buffer`. Gradient
 through the live batch; the moments are estimated on hundreds of points. This is what lets
 the batch size be chosen for memory rather than for the objective.
 
+### Scoring cost
+
+Scoring passes `with_lm_loss=False`. Supplying `labels` makes the base model materialise
+logits over the full 262144-token vocabulary — **5.5 GB in fp32 at batch 8, sequence 700**,
+scaling linearly with both — and `score()` discards the loss. That single allocation was the
+largest in an eval pass, and because it grows with sequence length it grew as the split's
+utterances got longer, which is what turned a minutes-long pass into four hours with a 73x
+throughput collapse.
+
+| at batch 8 | seq 400 | seq 700 | seq 1000 |
+|---|---|---|---|
+| logits, fp32 (discarded) | 3.12 GB | 5.47 GB | 7.81 GB |
+| all 49 hidden states | 1.12 GB | 1.96 GB | 2.80 GB |
+| the 8 the heads read | 0.18 GB | 0.32 GB | 0.46 GB |
+
+Predictions are unaffected — the heads read hidden states, which do not depend on `labels`.
+
 ### Batching
 
 `--train-batch-size` is the micro-batch; `--train-grad-accum` is how many of those are

@@ -130,7 +130,17 @@ class TutokanaModel(nn.Module):
         self.config = config
         self._delta_handle = register_delta.attach(base.get_input_embeddings())
 
-    def forward(self, batch: dict) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    def forward(
+        self, batch: dict, *, with_lm_loss: bool = True
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+        """Read every head from one pass. `with_lm_loss=False` skips the text objective.
+
+        That flag is worth its weight in memory. Passing `labels` makes the base model
+        materialise logits over the whole 262144-token vocabulary — 5.5 GB in fp32 at batch
+        8, sequence 700, scaling linearly with both. Scoring throws that loss away, so the
+        largest single allocation in an eval pass existed only to be discarded, and because
+        it scales with sequence length it grew as the split's utterances got longer.
+        """
         input_ids = batch["input_ids"]
         model_kwargs = {
             key: value
@@ -147,7 +157,7 @@ class TutokanaModel(nn.Module):
         }
         outputs = self.base(
             input_ids=input_ids,
-            labels=batch.get("labels"),
+            labels=batch.get("labels") if with_lm_loss else None,
             output_hidden_states=True,
             use_cache=False,
             **model_kwargs,
