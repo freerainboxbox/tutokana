@@ -11,12 +11,19 @@ __pycache__/
 # commit to hold its place.
 runs/
 
+# Run logs, for the same reason: they are records of local experiments, not of the code.
+# `run_logging` creates the directory on demand.
+logs/
+
 # wandb's local mirror. Everything needed to reproduce a run is in the committed config and
 # the run's own log; this is just the local upload spool.
 wandb/
 
-# macOS
-.DS_Store
+# Ad-hoc analysis dumps. `audit_data.py --json` and `evaluate.py --out` both take relative
+# paths and land here by default; they are outputs, not inputs.
+/*.json
 
-# Keep the directory, not its contents
-!logs/.gitkeep
+# Editor and OS local state.
+.vscode/
+.idea/
+.DS_Store
