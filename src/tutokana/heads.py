@@ -20,7 +20,9 @@ independent heads. That is the wrong shape of the right idea: rare symbols get t
 examples, no statistics are shared, and routing by the *gold* phone during training but the
 *emitted* phone at inference introduces a train/test skew. `film` buys the thing routing was
 actually reaching for — a per-phone difficulty prior — with two parameters per symbol, on
-top of a trunk trained on all the data at once.
+top of a trunk trained on all the data at once. `concat` is the richer alternative: a learned
+per-symbol embedding appended to the hidden state, which lets the trunk itself behave
+differently per phone rather than only rescaling its output.
 
 Output modes are per level. `soft_class` exists because 80.1% of phone accuracy labels are
 exactly 2.0: a plain regressor under any pointwise loss drifts to the mode, whereas a
@@ -32,6 +34,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
+#: Per-symbol conditioning strategies for the phone head. `none` shares one function across
+#: every symbol; `film` scales and shifts its output per symbol; `concat` appends a learned
+#: per-symbol embedding to its input. A head per symbol is deliberately absent — see the
+#: module docstring.
+PHONE_CONDITIONING = ("none", "film", "concat")
 
 
 class LayerMixture(nn.Module):
@@ -76,8 +84,9 @@ class ScoreHead(nn.Module):
                         expectation, so the prediction stays continuous.
       * `binary`      — one logit, supervised with weighted BCE (word stress only).
 
-    `n_conditions > 0` enables FiLM conditioning: a per-symbol scale and shift applied to
-    the head's output, with index 0 reserved as the shared fallback for unseen symbols.
+    `n_conditions > 0` enables per-symbol conditioning, with index 0 reserved as the shared
+    fallback for unseen symbols. `conditioning="film"` applies a learned scale and shift to
+    the head's output; `"concat"` appends a learned embedding to the input instead.
 
     Every head exposes both `predict_native` (the field's own scale, what metrics report)
     and `predict_normalized` (z-scored, what the correlation term consumes), so the three
@@ -91,6 +100,8 @@ class ScoreHead(nn.Module):
         mode: str = "regression",
         support: tuple[float, ...] | None = None,
         n_conditions: int = 0,
+        conditioning: str = "film",
+        condition_dim: int = 32,
         proj_size: int = 512,
         dropout: float = 0.1,
         mean: float = 0.0,
@@ -99,6 +110,10 @@ class ScoreHead(nn.Module):
         super().__init__()
         if mode not in ("regression", "soft_class", "binary"):
             raise ValueError(f"unknown head mode {mode!r}")
+        if conditioning not in PHONE_CONDITIONING:
+            raise ValueError(
+                f"unknown conditioning {conditioning!r}; known: {sorted(PHONE_CONDITIONING)}"
+            )
         if mode == "soft_class" and not support:
             raise ValueError("soft_class heads require a discrete support")
         self.mode = mode
@@ -110,6 +125,18 @@ class ScoreHead(nn.Module):
         )
         self.register_buffer("mean", torch.tensor(float(mean)), persistent=False)
         self.register_buffer("std", torch.tensor(float(std)), persistent=False)
+        self.conditioning = conditioning if n_conditions > 0 else "none"
+        self.film = self.embedding = None
+        if self.conditioning == "film":
+            # Zero-initialised, so conditioning starts as an exact identity and only earns
+            # its keep if the per-symbol prior is real.
+            self.film = nn.Embedding(n_conditions, 2)
+            nn.init.zeros_(self.film.weight)
+        elif self.conditioning == "concat":
+            self.embedding = nn.Embedding(n_conditions, condition_dim)
+            nn.init.zeros_(self.embedding.weight)
+            hidden_size = hidden_size + condition_dim
+
         self.body = nn.Sequential(
             nn.RMSNorm(hidden_size),
             nn.Linear(hidden_size, proj_size),
@@ -117,18 +144,17 @@ class ScoreHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(proj_size, self.n_outputs),
         )
-        self.film = None
-        if n_conditions > 0:
-            # Initialised to identity so conditioning starts as a no-op and only earns its
-            # keep if the per-symbol prior is real.
-            self.film = nn.Embedding(n_conditions, 2)
-            nn.init.zeros_(self.film.weight)
 
     def forward(self, states: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
-        out = self.body(states.float())
+        if self.conditioning != "none" and condition is None:
+            raise ValueError(
+                f"this head is {self.conditioning}-conditioned but got no condition index"
+            )
+        states = states.float()
+        if self.embedding is not None:
+            states = torch.cat([states, self.embedding(condition)], dim=-1)
+        out = self.body(states)
         if self.film is not None:
-            if condition is None:
-                raise ValueError("this head is FiLM-conditioned but got no condition index")
             gamma, beta = self.film(condition).unbind(dim=-1)
             out = out * (1.0 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
         return out
@@ -192,6 +218,7 @@ class HeadBank(nn.Module):
                     mode=spec["mode"],
                     support=spec.get("support"),
                     n_conditions=spec.get("n_conditions", 0),
+                    conditioning=spec.get("conditioning", "none"),
                     proj_size=proj_size,
                     dropout=dropout,
                     mean=spec.get("mean", 0.0),
@@ -237,6 +264,11 @@ def build_head_specs(
     label split is a detection problem, not a regression one, and a regressor on it converges
     to the constant 10 that made the predecessor's stress correlation undefined.
     """
+    if phone_conditioning not in PHONE_CONDITIONING:
+        raise ValueError(
+            f"unknown phone_conditioning {phone_conditioning!r}; "
+            f"known: {sorted(PHONE_CONDITIONING)}"
+        )
     from .data import FIELD_SUPPORT, TargetStats
     from .tokens import REGISTERS_BY_LEVEL, UNTRAINED_FIELDS
 
@@ -250,7 +282,8 @@ def build_head_specs(
             spec: dict = {"mode": mode, "mean": stats.mean[key], "std": stats.std[key]}
             if mode == "soft_class":
                 spec["support"] = FIELD_SUPPORT[(level, reg.field)]
-            if level == "phone" and phone_conditioning == "film":
+            if level == "phone" and phone_conditioning != "none":
                 spec["n_conditions"] = n_phone_conditions
+                spec["conditioning"] = phone_conditioning
             specs[f"{level}.{reg.field}"] = spec
     return specs

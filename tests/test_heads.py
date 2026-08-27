@@ -68,7 +68,9 @@ def test_soft_class_requires_a_support():
 def test_film_starts_as_the_identity():
     """Conditioning must earn its keep, so it begins as a no-op."""
     plain = ScoreHead(hidden_size=8, mode="regression").eval()
-    conditioned = ScoreHead(hidden_size=8, mode="regression", n_conditions=4).eval()
+    conditioned = ScoreHead(
+        hidden_size=8, mode="regression", n_conditions=4, conditioning="film"
+    ).eval()
     conditioned.body.load_state_dict(plain.body.state_dict())
     states = torch.randn(6, 8)
     assert torch.allclose(
@@ -76,10 +78,40 @@ def test_film_starts_as_the_identity():
     )
 
 
-def test_film_head_demands_a_condition():
-    head = ScoreHead(hidden_size=8, mode="regression", n_conditions=4)
-    with pytest.raises(ValueError):
-        head(torch.randn(2, 8))
+def test_conditioned_head_demands_a_condition():
+    for mode in ("film", "concat"):
+        head = ScoreHead(hidden_size=8, mode="regression", n_conditions=4, conditioning=mode)
+        with pytest.raises(ValueError, match="condition"):
+            head(torch.randn(2, 8))
+
+
+def test_concat_widens_the_input_and_starts_neutral():
+    """A learned per-symbol embedding on the input, zero-init so it begins as a no-op."""
+    head = ScoreHead(
+        hidden_size=8, mode="regression", n_conditions=4, conditioning="concat",
+        condition_dim=3,
+    ).eval()
+    assert head.body[1].in_features == 11
+    states = torch.randn(6, 8)
+    a = head(states, torch.zeros(6, dtype=torch.long))
+    b = head(states, torch.full((6,), 3, dtype=torch.long))
+    assert torch.allclose(a, b)  # every symbol embedding is zero at initialisation
+
+
+def test_unknown_conditioning_is_rejected():
+    """Silently degrading to `none` would make an ablation arm quietly measure nothing."""
+    with pytest.raises(ValueError, match="conditioning"):
+        ScoreHead(hidden_size=8, mode="regression", n_conditions=4, conditioning="per_phone")
+
+
+def test_build_head_specs_rejects_unknown_conditioning(utterances):
+    from tutokana.data import compute_target_stats
+
+    with pytest.raises(ValueError, match="phone_conditioning"):
+        build_head_specs(
+            ("phone",), {"phone": "soft_class"}, 7, "per_phone",
+            compute_target_stats(utterances),
+        )
 
 
 def test_build_head_specs_forces_binary_stress(utterances):
@@ -94,6 +126,7 @@ def test_build_head_specs_forces_binary_stress(utterances):
     )
     assert specs["word.stress"]["mode"] == "binary"
     assert specs["phone.accuracy"]["n_conditions"] == 7
+    assert specs["phone.accuracy"]["conditioning"] == "film"
     assert "utterance.completeness" not in specs  # measured, never trained
 
 
