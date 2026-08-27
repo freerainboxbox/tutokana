@@ -114,3 +114,55 @@ def test_stress_is_reweighted_even_when_its_level_is_not(utterances):
     reweighter = build_reweighter(utterances, config)
     assert "word.stress" in ALWAYS_REWEIGHTED
     assert reweighter.weights_for("word.stress", torch.tensor([0.0, 1.0])) is not None
+
+
+#: The real word-accuracy histogram of the training split, whose tail is the whole problem:
+#: accuracy 9 occurs 3 times in 15849 words.
+WORD_ACCURACY_HISTOGRAM = {"word.accuracy": {10.0: 13907, 3.0: 1109, 5.0: 358, 9.0: 3}}
+
+
+def _dynamic_range(reweighter, key):
+    weights = reweighter.tables[key][1]
+    return (weights.max() / weights.min()).item()
+
+
+def test_uncapped_inverse_frequency_has_a_ruinous_dynamic_range():
+    """The bug this cap exists for: one rare label outweighing hundreds of ordinary ones."""
+    uncapped = LabelReweighter(WORD_ACCURACY_HISTOGRAM, strength=1.0, maximum=0)
+    assert _dynamic_range(uncapped, "word.accuracy") > 1000
+
+
+def test_cap_bounds_the_dynamic_range():
+    capped = LabelReweighter(WORD_ACCURACY_HISTOGRAM, strength=1.0, maximum=10.0)
+    assert _dynamic_range(capped, "word.accuracy") == pytest.approx(10.0, rel=1e-4)
+
+
+def test_capped_weights_are_still_mean_one():
+    """The cap must not shift the effective learning rate."""
+    reweighter = LabelReweighter(WORD_ACCURACY_HISTOGRAM, strength=1.0, maximum=10.0)
+    histogram = WORD_ACCURACY_HISTOGRAM["word.accuracy"]
+    labels = torch.tensor([v for v, n in histogram.items() for _ in range(n)])
+    weights = reweighter.weights_for("word.accuracy", labels)
+    assert weights.mean().item() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_cap_preserves_the_ordering_of_rarity():
+    """Weakly, not strictly: labels rarer than the ceiling all tie there, by design."""
+    histogram = {"phone.accuracy": {2.0: 37707, 1.6: 2416, 0.2: 44}}
+    reweighter = LabelReweighter(histogram, strength=1.0, maximum=10.0)
+    values, weights = reweighter.tables["phone.accuracy"]
+    by_value = dict(zip(values, weights.tolist()))
+
+    assert by_value[0.2] >= by_value[1.6] > by_value[2.0]
+    assert by_value[0.2] == by_value[1.6]  # both rarer than the ceiling allows
+
+    # A cap wide enough to hold them apart keeps the ordering strict.
+    wide = LabelReweighter(histogram, strength=1.0, maximum=1000.0)
+    by_value = dict(zip(*[wide.tables["phone.accuracy"][0], wide.tables["phone.accuracy"][1].tolist()]))
+    assert by_value[0.2] > by_value[1.6] > by_value[2.0]
+
+
+def test_build_reweighter_passes_the_cap_through(utterances):
+    reweighter = build_reweighter(utterances, LossConfig(reweight_max=3.0))
+    for key in reweighter.tables:
+        assert _dynamic_range(reweighter, key) <= 3.0 + 1e-4

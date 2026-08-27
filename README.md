@@ -172,6 +172,22 @@ training marginal so switching reweighting on does not implicitly change the eff
 learning rate. `word.stress` is always reweighted regardless of `--reweight-levels`: at 99:1
 there is no configuration in which an unbalanced stress head is the intended experiment.
 
+Mean 1 is not enough on its own. These tails are extreme — word accuracy 9 occurs **3 times
+in 15849 words** — so raw inverse frequency spans a dynamic range of 4176x and a single word
+outweighs several hundred ordinary ones. `--reweight-max` (default 10) bounds that range
+before the mean-1 pass, which is the difference between a loss curve and a sawtooth:
+
+| field | uncapped max weight | dynamic range | capped (10x) |
+|---|---|---|---|
+| phone.accuracy | 92.0 | 810 | 3.58 |
+| word.accuracy | 475.9 | 4176 | 4.76 |
+| word.total | 132.2 | 1026 | 4.46 |
+| word.stress | 50.3 | 100 | 9.18 |
+
+The cap is on the *ratio*, applied before normalising — clamping afterwards does not work,
+because restoring mean 1 scales the clamped values back above the ceiling. Labels rarer than
+the ceiling allows tie there, which is the intended behaviour.
+
 ### Objective
 
 ```

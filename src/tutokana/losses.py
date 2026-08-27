@@ -85,12 +85,22 @@ class CorrelationBuffer:
             return
         pred = prediction.detach().flatten().float()
         tgt = target.detach().flatten().float()
-        self._predictions[key] = torch.cat([self._predictions.get(key, pred[:0]), pred])[
-            -self.capacity :
-        ]
-        self._targets[key] = torch.cat([self._targets.get(key, tgt[:0]), tgt])[
-            -self.capacity :
-        ]
+        # `.to(pred.device)` is not redundant. A resumed run restores this buffer from a
+        # checkpoint, where it was serialised on the host, so the history arrives on CPU
+        # while the live batch is on the accelerator. Concatenating across devices does not
+        # raise on MPS — it segfaults inside `structured_cat_out_mps`, on the first step
+        # after a resume, with no Python traceback.
+        self._predictions[key] = torch.cat(
+            [self._history(self._predictions, key, pred), pred]
+        )[-self.capacity :]
+        self._targets[key] = torch.cat(
+            [self._history(self._targets, key, tgt), tgt]
+        )[-self.capacity :]
+
+    @staticmethod
+    def _history(store: dict[str, torch.Tensor], key: str, live: torch.Tensor) -> torch.Tensor:
+        held = store.get(key)
+        return live[:0] if held is None else held.to(live.device)
 
     def augmented(
         self, key: str, prediction: torch.Tensor, target: torch.Tensor
@@ -144,6 +154,11 @@ class LossConfig:
     label_smoothing: float = 0.05
     reweight_levels: tuple[str, ...] = ("phone", "word")
     reweight_strength: float = 1.0
+    #: Largest weight any single label may carry. Uncapped inverse frequency is indefensible
+    #: on this corpus: word accuracy 9 occurs 3 times in 15849 words and would earn a 476x
+    #: multiplier, so one word in one micro-batch outweighs several hundred ordinary ones.
+    #: That is what turned the loss into a 10-148 sawtooth rather than a curve.
+    reweight_max: float = 10.0
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.
@@ -156,15 +171,33 @@ class LabelReweighter:
     Weights are normalised to mean 1 over the training marginal, so turning reweighting on
     does not implicitly change the learning rate — only the relative pull of rare labels.
     `strength` interpolates: 0 is uniform, 1 is full inverse frequency.
+
+    Mean 1 is necessary but not sufficient: the tail is what destabilises training, and these
+    label distributions have a very long one. Word accuracy 9 occurs 3 times in 15849 words,
+    so uncapped inverse frequency hands it a 476x multiplier — a single word outweighing
+    several hundred ordinary ones, which is how the loss became a 10-148 sawtooth instead of
+    a curve.
+
+    `maximum` bounds the *dynamic range*: no label may pull more than `maximum` times the
+    least-weighted one. Clamping the ratio before normalising keeps both guarantees exact in
+    one pass — clamping afterwards does not, because the renormalisation that restores mean 1
+    scales the clamped values back above the cap.
     """
 
-    def __init__(self, histograms: dict[str, dict[float, int]], strength: float = 1.0):
+    def __init__(
+        self,
+        histograms: dict[str, dict[float, int]],
+        strength: float = 1.0,
+        maximum: float = 10.0,
+    ):
         self.tables: dict[str, tuple[tuple[float, ...], torch.Tensor]] = {}
         for key, histogram in histograms.items():
             values = tuple(sorted(histogram))
             counts = torch.tensor([histogram[v] for v in values], dtype=torch.float32)
             probability = counts / counts.sum()
             weights = probability.clamp_min(1e-8).pow(-strength)
+            if maximum and maximum > 0:
+                weights = weights.clamp(max=float(weights.min()) * maximum)
             weights = weights / (weights * probability).sum()  # mean 1 under the marginal
             self.tables[key] = (values, weights)
 
@@ -295,5 +328,7 @@ def build_reweighter(utterances, config: LossConfig) -> LabelReweighter:
         if key.split(".", 1)[0] in config.reweight_levels or key in ALWAYS_REWEIGHTED
     }
     return LabelReweighter(
-        {k: v for k, v in histograms.items() if k in wanted}, config.reweight_strength
+        {k: v for k, v in histograms.items() if k in wanted},
+        config.reweight_strength,
+        config.reweight_max,
     )

@@ -229,11 +229,10 @@ def main() -> None:
             buffer_capacity=config.buffer_capacity,
             reweight_levels=tuple(config.reweight_levels),
             reweight_strength=config.reweight_strength,
+            reweight_max=config.reweight_max,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
         buffer = CorrelationBuffer(loss_config.buffer_capacity)
-
-        preflight(model, collator, mix[:2], device, loss_config, reweighter)
 
         # -- optimisation -------------------------------------------------------------
         steps_per_epoch = max(
@@ -245,13 +244,15 @@ def main() -> None:
         log.info("[train] %d steps (%d/epoch x %d epochs)",
                  total_steps, steps_per_epoch, config.train.epochs)
 
-        # Restored after preflight, not before: preflight runs a forward and backward pass,
-        # and its dropout would consume the very random stream being restored.
+        # Everything except the random streams is restored *before* preflight, so preflight
+        # exercises the state a resumed run will actually train with — a restored buffer
+        # holds host-side tensors, and concatenating those with an accelerator batch used to
+        # segfault on the first step with no traceback. The RNG comes after, because
+        # preflight's own dropout would otherwise consume the stream being restored.
         start_epoch, start_sample, step = 0, 0, 0
         if resume_state is not None:
             optimizer.load_state_dict(resume_state["optimizer"])
             scheduler.load_state_dict(resume_state["scheduler"])
-            restore_rng_state(resume_state["rng"])
             if resume_state.get("buffer") is not None:
                 buffer.load_state_dict(resume_state["buffer"])
             start_epoch = resume_meta["epoch"]
@@ -263,6 +264,11 @@ def main() -> None:
                     f"[resume] saved position {start_sample} is not on an accumulation "
                     f"boundary ({window}); the bundle does not match this configuration"
                 )
+
+        preflight(model, collator, mix[:2], device, loss_config, reweighter, buffer)
+
+        if resume_state is not None:
+            restore_rng_state(resume_state["rng"])
 
         run = None
         if config.train.wandb_mode != "disabled":

@@ -179,3 +179,56 @@ def test_diff_paths_map_onto_argparse_dests():
     b = Config(data=DataConfig(oversample_k=3), train=TrainConfig(seed=2), lora_r=16)
     dests = {path.replace(".", "__") for path, _, _ in a.diff(b)}
     assert dests == {"data__oversample_k", "train__seed", "lora_r"}
+
+
+def _accelerator():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return None
+
+
+def test_extend_keeps_the_buffer_on_the_live_batch_device():
+    """The invariant that a restored buffer violated: history follows the live batch."""
+    buffer = CorrelationBuffer(64)
+    live = torch.randn(4)
+    buffer.extend("k", live, live)
+    assert buffer._predictions["k"].device == live.device
+    buffer.extend("k", live, live)
+    assert buffer._predictions["k"].device == live.device
+
+
+def test_restored_buffer_survives_a_batch_on_another_device():
+    """A resumed run loads a host-side buffer and then trains on the accelerator.
+
+    Concatenating across devices does not raise on MPS — it segfaults inside
+    `structured_cat_out_mps` on the first step after a resume, with no Python traceback.
+    """
+    device = _accelerator()
+    if device is None:
+        pytest.skip("no accelerator available to cross devices with")
+
+    warm = CorrelationBuffer(64)
+    warm.extend("utterance.total", torch.randn(8, device=device), torch.randn(8, device=device))
+
+    restored = CorrelationBuffer(64)
+    restored.load_state_dict(warm.state_dict())  # comes back on the host
+    assert restored._predictions["utterance.total"].device.type == "cpu"
+
+    live = torch.randn(4, device=device)
+    restored.extend("utterance.total", live, live)  # used to segfault here
+    assert restored._predictions["utterance.total"].device.type == device.type
+    assert restored._predictions["utterance.total"].numel() == 12
+
+    pred, target = restored.augmented("utterance.total", live, live)
+    assert pred.device.type == device.type and pred.numel() == 16
+
+
+def test_preflight_accepts_a_buffer():
+    """Signature guard: preflight must be able to exercise the restored buffer."""
+    import inspect
+
+    from tutokana.engine import preflight
+
+    assert "buffer" in inspect.signature(preflight).parameters

@@ -48,13 +48,9 @@ class DataConfig:
 class TrainConfig:
     seed: int = 3407
     epochs: int = 2
-    # `grad_accum` counts micro-batches per optimizer step, so the effective batch is
-    # batch_size * grad_accum = 4. Activation memory is set by `batch_size` alone; raising
-    # `grad_accum` costs time, not memory. The correlation term does not need a large batch
-    # — that is what losses.CorrelationBuffer is for — so 2 x 2 is a memory-driven default,
-    # not a compromise on the objective.
-    batch_size: int = 2
-    grad_accum: int = 2
+    # Effective batch size = batch_size * grad_accum
+    batch_size: int = 1
+    grad_accum: int = 4
     learning_rate: float = 1e-4
     head_learning_rate: float = 1e-3
     weight_decay: float = 0.01
@@ -96,6 +92,7 @@ class Config:
     lambda_lm: float = 0.5
     buffer_capacity: int = 512
     reweight_strength: float = 1.0
+    reweight_max: float = 10.0
     reweight_levels: tuple[str, ...] = ("phone", "word")
     level_weight_phone: float = 1.0
     level_weight_word: float = 1.0

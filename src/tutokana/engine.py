@@ -98,8 +98,13 @@ def batches(items: list, size: int):
 
 
 def preflight(model, collator, samples: list[Utterance], device, loss_config: LossConfig,
-              reweighter=None) -> None:
-    """One forward+backward over a tiny batch, asserting everything that can be asserted."""
+              reweighter=None, buffer=None) -> None:
+    """One forward+backward over a tiny batch, asserting everything that can be asserted.
+
+    `buffer` is passed through rather than stubbed out: on a resumed run it arrives holding
+    host-side tensors from the checkpoint, and that is exactly the state whose first
+    interaction with an accelerator batch needs to be proven here rather than at step one.
+    """
     batch = move_batch(collator(samples), device)
 
     if batch.get("input_features") is None:
@@ -125,7 +130,7 @@ def preflight(model, collator, samples: list[Utterance], device, loss_config: Lo
     model.train()
     head_outputs, lm_loss = model(batch)
     total, parts = composite_loss(
-        model.heads, head_outputs, batch["heads"], loss_config, None, reweighter, lm_loss
+        model.heads, head_outputs, batch["heads"], loss_config, buffer, reweighter, lm_loss
     )
     total.backward()
 
