@@ -318,12 +318,14 @@ src/tutokana/        the package
   config.py            frozen dataclass config, argparse binding, run logging
 experiments/         one-off probes and ablations
 logs/                train-<run_id>-<timestamp>.log, eval-<run_id>-<timestamp>.log
-runs/<run_id>/       adapter, heads, target statistics, config
+runs/<run_id>/       adapter, heads, target statistics, config — gitignored, created on demand
 tests/
 ```
 
-Base weights live in the standard Hugging Face cache, never in the repo. Set `HF_HOME` to
-move it.
+Base weights live in the standard Hugging Face cache, never in the repo — set `HF_HOME` to
+move it. `runs/` is a working directory and is gitignored in full: a single run carries a
+LoRA adapter, a ~63 MB head bundle and ~1.2 GB of optimizer state. Both `runs/` and `logs/`
+are created on demand, so a fresh clone needs no setup beyond `uv sync`.
 
 ## Usage
 

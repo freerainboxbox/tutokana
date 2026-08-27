@@ -5,24 +5,18 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Model weights and optimizer state. runs/ is a working directory, not an artefact store: a
-# single run carries a ~63 MB head bundle, a LoRA adapter, and ~1.2 GB of AdamW moments, and
-# none of that belongs in git history. The small JSON beside them — config.json,
-# target_stats.json, resume.json — is the run's reproducible record, so that stays tracked.
-runs/**/*.safetensors
-runs/**/*.pt
-runs/**/*.pth
-runs/**/*.bin
-runs/**/adapter/
-runs/*/checkpoint-*/
-runs/*/*.partial.log
+# Run artefacts. runs/ is a working directory — LoRA adapters, a ~63 MB head bundle, ~1.2 GB
+# of AdamW moments and resume metadata rewritten every checkpoint. None of it belongs in a
+# public reference, and train.py creates the directory on demand, so there is nothing to
+# commit to hold its place.
+runs/
 
-# wandb's local mirror; logs/ and the run JSON already hold everything reproducible.
+# wandb's local mirror. Everything needed to reproduce a run is in the committed config and
+# the run's own log; this is just the local upload spool.
 wandb/
 
 # macOS
 .DS_Store
 
-# Keep the directories, not their contents
-!runs/.gitkeep
+# Keep the directory, not its contents
 !logs/.gitkeep
