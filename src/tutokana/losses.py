@@ -1,33 +1,26 @@
-"""Losses: a pointwise term that fits, and a correlation term that refuses to collapse.
+"""The composite objective.
 
-The failure this file exists to prevent is variance collapse. In the predecessor every
-field predicted with a smaller standard deviation than the gold labels, and two fields
-(utterance completeness, word stress) came out literally constant, making their correlation
-undefined. That is what a mode-seeking objective does to a saturated label distribution:
-80.1% of phone accuracies are exactly 2.0 and 88.0% of word accuracies are exactly 10, so
-"always predict the mode" is a strong local optimum under any purely pointwise loss.
+    L = sum_level w_level * [ mean(pointwise) + lambda_ccc * (1 - CCC) ]
+        + lambda_detect * BCE(below ceiling)  +  lambda_lm * CE(text)
 
-Three things push back on it:
+The labels are saturated — 80.1% of phone accuracies are exactly 2.0, 88.0% of word
+accuracies exactly 10 — so "predict the mode" is a strong local optimum for any purely
+pointwise loss, and the failure mode is variance collapse. Four things push back:
 
-**log-cosh** rather than MSE. Smooth everywhere, gradient bounded by 1, so the ~20% of
-genuinely low scores are not drowned out by the outlier-squared term — but on its own it
-still minimises at the mode, which is why it is not the whole story.
+* **log-cosh** rather than MSE: smooth, gradient bounded by 1, so the ~20% of low scores are
+  not drowned out by an outlier-squared term.
+* **Concordance correlation, not Pearson.** CCC penalises shrunken variance and shifted mean;
+  Pearson is invariant to both and would accept a collapsed prediction rescaled after the fact.
+* **A buffer**, because one batch is not a population. `CorrelationBuffer` holds a detached
+  FIFO of recent (prediction, target) pairs and estimates the statistic over live batch plus
+  buffer. Gradient flows only through the live batch.
+* **Label-frequency reweighting**, capped in dynamic range.
 
-**Concordance correlation (CCC), not Pearson.** `CCC = 2*cov / (var_x + var_y + (mu_x-mu_y)^2)`
-penalises exactly the two things that went wrong: shrunken variance and shifted mean.
-Pearson is invariant to both, so optimising it would happily accept a collapsed prediction
-rescaled after the fact.
+Detection (`lambda_detect`) is separate from all of that: it optimises "is this label below
+the ceiling", which is ~99% of the achievable rank correlation.
 
-**A buffer, because one batch is not a population.** Utterance-level correlation over a
-batch of eight is noise. `CorrelationBuffer` keeps a detached FIFO of recent (prediction,
-target) pairs per head and estimates the statistic over `live batch (with gradient)` union
-`buffer (without)`. Gradient still flows only through the live batch; the moments are
-estimated on hundreds of points. Phone level does not need the help — eight utterances is
-already ~400 phones — but it costs nothing to treat every head the same way.
-
-Level weights are applied *after* normalising each level's loss by its element count.
-Without that, phones (~19 per utterance) outnumber the four utterance registers by almost
-twenty to one and the utterance heads never get a say.
+Level losses are normalised by element count before weighting, or phones (~19 per utterance)
+drown out the four utterance registers.
 """
 
 from __future__ import annotations
@@ -85,11 +78,8 @@ class CorrelationBuffer:
             return
         pred = prediction.detach().flatten().float()
         tgt = target.detach().flatten().float()
-        # `.to(pred.device)` is not redundant. A resumed run restores this buffer from a
-        # checkpoint, where it was serialised on the host, so the history arrives on CPU
-        # while the live batch is on the accelerator. Concatenating across devices does not
-        # raise on MPS — it segfaults inside `structured_cat_out_mps`, on the first step
-        # after a resume, with no Python traceback.
+        # History follows the live batch's device: a resumed run restores this buffer from
+        # the host, and concatenating across devices segfaults on MPS rather than raising.
         self._predictions[key] = torch.cat(
             [self._history(self._predictions, key, pred), pred]
         )[-self.capacity :]
@@ -164,21 +154,15 @@ class LossConfig:
     reweight_levels: tuple[str, ...] = ("phone",)
     reweight_strength: float = 1.0
     #: Largest ratio between any two label weights, applied before the mean-1 pass. Uncapped
-    #: inverse frequency is indefensible on this corpus: word accuracy 9 occurs 3 times in
-    #: 15849 words and spans a 4176x range, so one word in one micro-batch outweighs several
-    #: hundred ordinary ones. That is what turned the loss into a 10-148 sawtooth.
+    #: inverse frequency spans a 4176x range here (word accuracy 9 occurs 3 times in 15849
+    #: words), which makes the loss a sawtooth driven by whichever rare label is in the batch.
     reweight_max: float = 10.0
-    #: Weight on the auxiliary "is this label below the ceiling?" term. 0 disables it.
-    #:
-    #: Decomposing the achievable Spearman on the test split shows perfect ceiling-vs-not
-    #: detection reaching 0.671 of the 0.680 available on phone accuracy, and perfect
-    #: ordering below the ceiling reaching 0.077. The rank correlation is a detection metric
-    #: in disguise, and nothing in the objective was optimising detection directly: the
-    #: multi-class cross-entropy spends most of its mass separating 1.8 from 2.0.
-    lambda_detect: float = 0.0
-    #: Weight on the positive (imperfect) class in that term. The base rate is 19% for phone
-    #: accuracy and 10% for word accuracy, so 1.0 lets the majority dominate.
-    detect_pos_weight: float = 1.0
+    #: Weight on the auxiliary "is this label below the ceiling?" term; 0 is the ablation.
+    #: Detection is ~99% of the achievable Spearman, and the multi-class cross-entropy alone
+    #: spends most of its mass separating 1.8 from 2.0 instead.
+    lambda_detect: float = 0.5
+    #: Positive-class weight in that term; 4.3 balances phone accuracy's 19% base rate.
+    detect_pos_weight: float = 4.3
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.

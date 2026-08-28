@@ -1,27 +1,16 @@
-"""speechocean762 loading, target extraction, splits and normalisation statistics.
+"""speechocean762 loading and per-field targets.
 
-The corpus is 2500 train / 2500 test utterances of L1-Mandarin English learners, scored by
-five experts at three granularities. Facts that shape everything downstream, all measured
-against the live dataset rather than quoted (reproduce with experiments/audit_data.py):
+Targets are z-scored per field with training-split statistics, persisted to the run directory
+and restored at eval. Correlation is affine-invariant so this is free, and it equalises
+gradient scale across fields whose standard deviations differ several-fold.
 
-  * Phone accuracy is NOT the {0,1,2} rubric handed to each annotator. The released label
-    is their MEAN, quantised to 0.2 — eleven values in [0.0, 2.0], with 2.0 covering 80.1%
-    of train phones. Rounding it to three classes throws away roughly a fifth of the
-    label's real signal, and caps achievable correlation.
-  * Word stress is 5 or 10 with only 1.0% at 5 (160 of 15849 train words). It is a 99:1
-    binary problem wearing a regression costume, so `stress_binary()` maps it to {0,1} for
-    a weighted BCE head. Published SOTA is 0.366; a fine-tuned Qwen2-Audio managed -0.01.
-    Report it; do not tune against it.
-  * Utterance completeness is 10.0 for 99.6% of train (sigma 0.11). It is measured and
-    reported but never trained — see tokens.UNTRAINED_FIELDS.
-  * Word accuracy is 88% exactly 10, and bimodal: the value 4 appears zero times in train.
-  * Audio is short — mean 4.1 s, p95 8.1 s, max 20.4 s. At Gemma 4's 40 ms per audio token
-    that is ~100 tokens median and ~510 worst case, comfortably inside both the 750-token
-    audio budget and the 1024 sliding-attention window.
+Standard deviations are floored at `MIN_STD_FRACTION` of the field's range. Without it a
+near-constant field (completeness is 10.0 for 99.6% of the corpus) produces z-scores in the
+thousands.
 
-The official train/test split is speaker-disjoint (125 speakers each). `speaker_split()`
-preserves that property when carving a validation slice out of train: a random subset would
-share speakers with what remains and read optimistically.
+`TargetStats.support` records the values each label actually takes. Predictions can be
+rounded back onto that grid at eval (`evaluate.py --snap`); it must be the *training* grid,
+since deriving it from the split under evaluation would be reading that split's labels.
 """
 
 from __future__ import annotations
@@ -165,7 +154,7 @@ def load_split(split: str, limit: int | None = None) -> list[Utterance]:
     """Load and flatten a speechocean762 split.
 
     Materialised as a plain list: the whole corpus is under 3 hours of audio, and holding
-    it in memory removes a per-epoch decode cost that dominated the predecessor's runtime.
+    it in memory removes a per-epoch decode cost.
     """
     from datasets import load_dataset
 
@@ -297,7 +286,7 @@ def stratified_indices(utterances: list[Utterance], n: int) -> list[int]:
     Half the picks are evenly spaced over the split sorted by utterance total; half are
     evenly spaced over the mispronunciation-carrying subset, sorted the same way. A
     contiguous prefix would be score-range-restricted and would understate correlation,
-    which is the trap the predecessor documented after evaluating on offset/limit slices.
+    which is what a contiguous offset/limit slice would give.
     """
     n = min(n, len(utterances))
     if n <= 0:

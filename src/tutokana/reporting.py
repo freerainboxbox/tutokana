@@ -1,16 +1,8 @@
-"""One renderer for the results table — console, log file and wandb all read from here.
+"""Result tables. One renderer for console, log file and wandb.
 
-Published reference rows are carried alongside the measured ones so a run is always read
-against the field rather than against itself. The numbers below are transcribed from the
-sources named in `BASELINES`; they are context, never anything this code computes.
-
-The bar is HMamba, not the Phi-4-multimodal paper this project started from. That paper
-reports no word-level or phoneme-level scores at all — only utterance accuracy/fluency/
-prosodic/total plus transcription error rates — and its utterance numbers (0.645 / 0.733 /
-0.714 / 0.668 for LoRA at four epochs) are within noise of what the predecessor already
-achieved. Its headline claim of state-of-the-art "phoneme-level accuracy" is mislabelled
-utterance-level accuracy, and at 0.743 it sits well below HMamba's 0.807 from earlier the
-same year.
+`render_table` is the full diagnostic view; `render_table(lite=True)` reports only the
+columns the literature reports (PCC and MSE). Published baselines in `BASELINES` are
+transcribed from their sources and are never computed here.
 """
 
 from __future__ import annotations
@@ -101,43 +93,37 @@ BASELINES: tuple[Baseline, ...] = (
             "utterance.total": 0.72,
         },
     ),
-    Baseline(
-        "gemma-4-12b-so762",
-        "predecessor, glowing-moon-28",
-        {
-            "phone.accuracy": 0.358,
-            "word.accuracy": 0.371,
-            "word.total": 0.381,
-            "utterance.accuracy": 0.639,
-            "utterance.fluency": 0.724,
-            "utterance.prosodic": 0.708,
-            "utterance.total": 0.667,
-        },
-    ),
 )
 
 
 def _fmt(value: float, spec: str = "6.3f") -> str:
     if value != value:  # NaN
-        # Strip the sign flag before reusing the width: "+9.3f" is a valid number format but
-        # ">+9" is not a valid string one, and a NaN delta is exactly what a constant
-        # prediction produces — snapping word.stress collapses it to a single value.
-        width = spec.split(".")[0].lstrip("+- ")
-        return f"{'nan':>{width}}"
+        # ">+9" is not a valid string format, so drop the sign flag before reusing the width.
+        return f"{'nan':>{spec.split('.')[0].lstrip('+- ')}}"
     return f"{value:{spec}}"
 
 
-def render_table(results: dict[str, FieldMetrics], title: str = "results") -> str:
-    """The measured table: correlation with interval, rank correlation, error, dispersion."""
-    header = (
-        f"{'field':<24}{'n':>8}{'PCC':>8}{'95% CI':>17}{'SCC':>8}"
-        f"{'MSE':>8}{'MAE':>7}{'pred mu+-sd':>16}{'gold mu+-sd':>16}{'sd ratio':>10}"
-    )
+def render_table(
+    results: dict[str, FieldMetrics], title: str = "results", lite: bool = False
+) -> str:
+    """Per-field results. `lite` drops everything the published tables do not carry."""
+    if lite:
+        header = f"{'field':<24}{'n':>8}{'PCC':>8}{'MSE':>9}"
+    else:
+        header = (
+            f"{'field':<24}{'n':>8}{'PCC':>8}{'95% CI':>17}{'SCC':>8}"
+            f"{'MSE':>8}{'MAE':>7}{'pred mu+-sd':>16}{'gold mu+-sd':>16}{'sd ratio':>10}"
+        )
     lines = [f"=== {title} ===", header, "-" * len(header)]
     for level, field in REPORT_FIELDS:
         key = f"{level}.{field}"
         m = results.get(key)
         if m is None:
+            continue
+        if lite:
+            lines.append(
+                f"{key:<24}{m.n:>8}{_fmt(m.pearson, '8.3f')}{_fmt(m.mse, '9.3f')}"
+            )
             continue
         interval = (
             "        --       "
@@ -190,7 +176,7 @@ def render_transcription(metrics) -> str:
 
 
 def wandb_metrics(results: dict[str, FieldMetrics], prefix: str = "eval") -> dict[str, float]:
-    """Flatten the table for wandb. Dispersion is logged too — it is the early warning."""
+    """Flatten the table for wandb. sigma_ratio is logged as the variance-collapse warning."""
     flat: dict[str, float] = {}
     for key, m in results.items():
         flat[f"{prefix}/pcc/{key}"] = m.pearson
@@ -200,20 +186,19 @@ def wandb_metrics(results: dict[str, FieldMetrics], prefix: str = "eval") -> dic
     return flat
 
 
-#: Above this share of labels below the maximum, "detect the imperfect ones" stops being a
-#: detection problem — everything is imperfect, and F1 is maximised by saying so.
+#: Fields where more than this share of labels sit below the maximum have no dominant
+#: ceiling, so "detect the imperfect ones" is not a detection problem and F1 is maximised by
+#: calling everything positive.
 CEILING_MAJORITY = 0.5
 
 
 def render_detection(results: dict, ceilings: dict[str, float] | None = None) -> str:
-    """Detection of imperfect labels, plus how much of the achievable SCC is being reached.
+    """Detection of labels below the field's maximum, with the achievable SCC alongside.
 
-    Spearman on this corpus is a detection metric wearing a rank correlation's clothes: on
-    the test split, perfect ceiling-vs-not detection with random ordering below reaches 0.671
-    of the 0.680 achievable on phone accuracy, and perfect ordering without detection reaches
-    0.077. Reporting detection directly saves inferring it from SCC, and the ceiling column
-    says how much of the rank correlation was ever available — word accuracy caps at 0.528
-    for any continuous predictor simply because 90% of its labels are tied at 10.
+    On this corpus Spearman is largely a detection metric: perfect ceiling-vs-not detection
+    with random ordering below reaches 0.671 of the 0.680 achievable on phone accuracy, while
+    perfect ordering without detection reaches 0.077. The ceiling column states how much rank
+    correlation was ever available, which is set by how tied the labels are.
     """
     header = (
         f"{'field':<24}{'imperfect':>11}{'base rate':>11}{'AUC':>8}{'F1':>8}"

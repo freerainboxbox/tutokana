@@ -1,11 +1,9 @@
 """Interruption and clean resume.
 
-Interrupting is the easy half. A resume is *clean* when continuing produces the trajectory
-the uninterrupted run would have had, which needs more than the weights: optimizer moments,
-the schedule position, the random streams driving shuffling and dropout, the correlation
-buffer's population, and where in the epoch the run stopped. Everything else — the mix, the
-splits, the epoch orders, the target statistics — is recomputed from the saved config, and
-these tests pin that determinism down.
+A resume is clean when continuing produces the trajectory the uninterrupted run would have
+had. That needs optimizer moments, schedule position, RNG streams, the correlation buffer and
+the epoch/sample offset; the mix, splits, epoch orders and target statistics are recomputed
+from the saved config, and these tests pin that determinism.
 """
 
 from __future__ import annotations

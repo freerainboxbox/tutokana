@@ -1,4 +1,4 @@
-"""Progress reporting, and the console/file split it depends on."""
+"""Progress reporting and the console/file split."""
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ def test_resumed_run_reports_only_its_own_throughput(logger_and_records):
 
 
 def test_eta_uses_the_recent_window_not_the_lifetime_average():
-    """The predecessor's cumulative average hid a 73x collapse; a window must not."""
+    """A cumulative average hides a throughput collapse; a window must not."""
     log = logging.getLogger("tutokana.test.progress.eta")
     log.handlers.clear(); log.addHandler(logging.NullHandler())
     bar = Progress(1000, log, "score", every=10_000, enabled=False)

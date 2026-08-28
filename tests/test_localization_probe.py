@@ -1,9 +1,8 @@
 """The localisation probe's ablation and bucketing, checked without loading a model.
 
-The probe decides an architecture question — whether a forced aligner would add anything —
-so its arithmetic needs to be right before a result is read off it. These tests confirm the
-zeroing touches only the intended span, and that the distance bucketing actually separates
-the two hypotheses it is meant to distinguish.
+The probe decides whether a forced aligner would add anything, so its arithmetic is pinned
+here: the zeroing must touch only the intended span, and the distance bucketing must separate
+a localised model from a diffuse one.
 """
 
 from __future__ import annotations

@@ -1,30 +1,13 @@
-"""The train/eval prompt contract — one renderer, used by both sides.
+"""Rendering the prompt and the assistant turn.
 
-The predecessor lost days to a mismatch here: training rendered assistant turns the
-template's "completed turn" way while evaluation decoded from the generation prompt, so the
-empty thought block that `add_generation_prompt=True` always appends sat exactly where the
-first score tokens were generated — a prefix the model had never been trained on. The fix
-is structural, not a convention: training text is *literally* the eval prompt plus the
-target, produced by the same function, and `tests/test_prompting.py` asserts it byte for
-byte.
+One unified turn carries the phone transcript with a register after each phone, three
+registers after each word, and four utterance registers at the end. Ordering is bottom-up
+under causal masking, so word registers see their phones and utterance registers see
+everything.
 
-Rendered target, for `levels=("phone","word","utterance")`:
-
-    <task>
-    WE<sep_phones>W<phn> IY0<phn><sep_word><w_acc><w_str><w_tot>
-    CALL<sep_phones>K<phn> AO0<phn> L<phn><sep_word><w_acc><w_str><w_tot>
-    <u_acc><u_pro><u_flu><u_tot><turn|>
-
-Each word's registers follow that word's phones; the utterance registers follow every word,
-with the total last. Under causal masking this reads bottom-up — a word register attends to
-its own phones' registers, and the utterance registers attend to all of them. That is the
-phone -> word -> utterance hierarchy HMamba's ablation credits for its margin over a flat
-last-layer readout.
-
-The registers themselves are never sampled at inference. They are structurally determined,
-so they are force-fed and every head is read from a single forward pass. That makes the
-scored evaluation a forward pass per utterance instead of a ~700-token constrained decode,
-and it removes malformed-output handling entirely.
+`render_training_text` is exactly `render_prompt` + `render_target`; a test asserts the
+prefix is byte-identical to what evaluation sends, since a train/eval prompt mismatch is
+silent and expensive.
 """
 
 from __future__ import annotations
@@ -43,9 +26,8 @@ from .tokens import (
     WORD_REGISTERS,
 )
 
-#: Short by design. The predecessor's instruction was ~1300 tokens, most of it a JSON format
-#: specification that no longer exists — the output shape is now the register layout, and a
-#: format the model is trained on does not need to be described to it in prose.
+#: Short by design: the register layout *is* the output format, so no format specification
+#: is needed in prose.
 INSTRUCTION = (
     "Assess English pronunciation under the speechocean762 protocol. The speakers are "
     "non-native learners whose first language is Mandarin; about half are children. "

@@ -132,7 +132,7 @@ def test_registers_are_excluded_from_the_language_loss(collator, utterances):
 
 
 def test_audio_and_prompt_are_excluded_from_the_language_loss(collator, utterances):
-    """The predecessor trained a deaf model by supervising audio placeholder positions."""
+    """Supervising audio placeholder positions produces a model that cannot hear."""
     batch = collator(utterances[:2])
     labels, ids = batch["labels"], batch["input_ids"]
     audio_id = collator.tokenizer.convert_tokens_to_ids("<|audio|>")

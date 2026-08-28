@@ -1,14 +1,11 @@
 """Configuration and logging.
 
-Config is a frozen dataclass tree bound to argparse, which buys one specific thing: the
-resume file is `asdict(config)` rather than a hand-maintained list of keys. The predecessor
-kept that list by hand and it drifted — a resumed run silently reconstructed a different
-training mix than the one it was continuing.
+Config is a frozen dataclass tree bound to argparse, so the resume file is `asdict(config)`
+rather than a hand-maintained key list that can drift out of sync.
 
-Log files are named for when the run *finished*, which means the name cannot be known when
-the handler is created. `run_logging` writes to `<name>.partial.log` and renames on the way
-out through a `finally`, so a crashed or interrupted run still leaves a completely written,
-correctly named file rather than nothing at all.
+Log files are named for when the run *finished*, so `run_logging` writes to
+`<name>.partial.log` and renames through a `finally`; a crashed run still leaves a complete,
+correctly named file.
 """
 
 from __future__ import annotations
@@ -93,8 +90,8 @@ class Config:
     buffer_capacity: int = 512
     reweight_strength: float = 1.0
     reweight_max: float = 10.0
-    lambda_detect: float = 0.0
-    detect_pos_weight: float = 1.0
+    lambda_detect: float = 0.5
+    detect_pos_weight: float = 4.3
     reweight_levels: tuple[str, ...] = ("phone",)
     level_weight_phone: float = 1.0
     level_weight_word: float = 1.0
@@ -115,7 +112,7 @@ class Config:
 
         A resumed run reconstructs its mix, splits and schedule from the saved config, so a
         conflicting flag cannot be honoured — but it must be named rather than dropped
-        silently, which is how the predecessor's resumed runs quietly drifted.
+        silently, or the resumed run reconstructs a different training mix.
         """
 
         def walk(a, b, prefix=""):

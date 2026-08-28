@@ -1,11 +1,9 @@
 """Detection metrics, the Spearman ceiling, and snapping to the label grid.
 
-These exist because the reported rank correlation was being read as a model failure when
-most of it is a property of the labels. On the test split a *perfect* continuous predictor
-caps at SCC 0.528 on word accuracy, simply because 90% of the labels are tied at 10 and a
-continuous readout never ties. Meanwhile perfect ceiling-vs-not detection with random
-ordering below reaches 99% of the achievable rank correlation, and perfect ordering with no
-detection reaches 1% — so Spearman here is a detection metric in disguise.
+A continuous predictor caps at SCC 0.528 on word accuracy because 90% of the labels are tied
+at 10. Meanwhile perfect ceiling-vs-not detection reaches 99% of the achievable rank
+correlation and perfect ordering below it reaches 1%, so Spearman here is largely a detection
+metric. These tests pin both facts and the arithmetic that reports them.
 """
 
 from __future__ import annotations

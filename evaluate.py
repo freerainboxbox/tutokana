@@ -1,25 +1,17 @@
-"""Evaluate a trained tutokana run on the speechocean762 test split.
+"""Evaluate a trained run on the speechocean762 test split.
 
 Scoring is teacher-forced: the canonical phone sequence comes from the dataset, so every
-register aligns one-to-one with its gold score and one forward pass reads all eight fields
-at once. That is both the fast path (minutes, not the predecessor's thirty-hour constrained
-decode) and the comparable one — if the model generated its own phone sequence, a few
-percent of positions would be misaligned and the phone correlation would no longer mean the
-same thing as the published numbers.
+register aligns one-to-one with its gold score and one forward pass reads all eight fields.
+A model generating its own phone sequence would misalign a few percent of positions and the
+phone correlation would no longer mean what the published tables mean.
 
-`--generative` additionally decodes the transcript and reports phone error rate and word
-exact-match, which is where the generative capability is actually measured.
+    python evaluate.py                     # full diagnostic table
+    python evaluate.py --lite              # only what the literature reports
+    python evaluate.py --run-id run-...    # a specific run ("base" = untuned floor)
+    python evaluate.py --generative        # also decode transcripts, report PER
 
-    python evaluate.py                        # the most recently completed run
-    python evaluate.py --run-id run-20260826-2117
-    python evaluate.py --split train --limit 200
-    python evaluate.py --generative --generative-samples 200
-
-The console shows a progress bar with rate and ETA; the log file gets a timestamped detail
-line every ten utterances, including accelerator memory. Ctrl-C stops scoring at the current
-batch and reports the correlations over whatever was scored, labelled PARTIAL.
-
-The table is printed and written verbatim to `logs/eval-<run_id>-<timestamp>.log`.
+`--generative` measures the generative capability separately. The table is printed and
+written verbatim to `logs/eval-<run_id>-<timestamp>.log`.
 """
 
 from __future__ import annotations
@@ -77,6 +69,11 @@ def parse_args() -> argparse.Namespace:
              "raise this only after watching the memory column in the log (default: 2)",
     )
     parser.add_argument("--no-bootstrap", action="store_true", help="skip the correlation intervals")
+    parser.add_argument(
+        "--lite", action="store_true",
+        help="report only PCC and MSE against the published baselines, omitting the "
+             "rank correlation, dispersion, detection and snapping sections",
+    )
     parser.add_argument("--generative", action="store_true",
                         help="also decode transcripts and report phone error rate")
     parser.add_argument("--generative-samples", type=int, default=200)
@@ -213,12 +210,12 @@ def main() -> None:
         title = f"{run_id} / {args.split}"
         if result.partial:
             title += f" (PARTIAL: {result.scored}/{len(utterances)})"
-        table = render_table(result.metrics, title=title)
+        table = render_table(result.metrics, title=title, lite=args.lite)
         comparison = render_baselines(result.metrics)
         sections = [table, comparison]
 
         detection = {}
-        if not args.no_detection:
+        if not args.no_detection and not args.lite:
             detection = {
                 key: detection_metrics(result.predictions[key], result.gold[key])
                 for key in result.predictions
@@ -230,7 +227,7 @@ def main() -> None:
             sections.append(render_detection(detection, ceilings))
 
         snapped_metrics = {}
-        if args.snap:
+        if args.snap and not args.lite:
             missing = [k for k in result.predictions if k not in (stats.support or {})]
             if missing:
                 log.warning(

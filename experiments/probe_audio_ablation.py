@@ -1,19 +1,17 @@
 """Is the model actually listening? Score the same transcripts against altered audio.
 
-This exists because the predecessor once trained a model that was functionally deaf: it
-produced identical output for real, zeroed, noised and swapped audio, because ~10% of its
-supervised tokens were audio placeholders whose label is a constant, and that constant target
-collapsed the representations at exactly the positions carrying the speech. Nothing in a
-loss curve reveals that. This does.
+A model can be functionally deaf without any loss curve showing it — supervising the constant
+`<|audio|>` id collapses the representations at exactly the positions carrying speech. This
+probe catches that.
 
-For each condition the utterance-level scores are re-read and compared against the real-audio
-run. A model that is listening shows a large mean absolute shift under `zeros` and `swapped`
-and a small one under `identity`; a deaf model shows near-zero everywhere.
+Utterance-level scores are re-read under each condition and compared against the real-audio
+run. A listening model shifts substantially under `zeros`, `noise` and `swapped`, and by ~0
+under `identity`; a deaf model shifts by ~0 everywhere.
 
     uv run python experiments/probe_audio_ablation.py [--run-id RUN] [--n 32]
 
-The `identity` row is the control: it re-scores the untouched audio, so its shift is pure
-numerical noise and every other row should be read against it.
+`identity` re-scores untouched audio, so its shift is numerical noise and every other row
+should be read against it.
 """
 
 from __future__ import annotations

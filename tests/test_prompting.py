@@ -1,9 +1,7 @@
-"""The prompt contract: training text must be the eval prompt plus the target, exactly.
+"""The prompt contract: what training renders must prefix-match what evaluation sends.
 
-The predecessor's most expensive bug was a drift between these two. Training rendered
-assistant turns one way while evaluation decoded from the generation prompt, so the empty
-thought block the chat template appends sat immediately before the first generated score —
-a prefix the model had never seen. That is now a test rather than a convention.
+A drift between the two is silent — the model trains on one format and is asked for another —
+so it is asserted rather than left as a convention.
 """
 
 from __future__ import annotations

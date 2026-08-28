@@ -1,23 +1,18 @@
-"""Metrics. The standard eight correlations, plus the columns that catch a lie.
+"""Metrics.
 
 speechocean762 is scored by Pearson correlation per aspect per level, flattened over the
-whole test split (all 2500 utterances, all ~16k words, all ~47k phones) — not macro-averaged
-per utterance. That is the protocol GOPT established and every paper since has followed, so
-`pearson` is what goes in the comparison column.
+whole split rather than macro-averaged per utterance. That is the protocol the published
+tables use, so `pearson` is the comparison column.
 
-Two additions the predecessor's table lacked, both of which exist because a bare correlation
-can hide the failure this project is about:
+Three additions the published tables lack:
 
-* **Spearman.** Both recent Microsoft papers argue Pearson is inflated on speechocean762's
-  skewed marginals — on their private set Pearson runs 0.87-0.95 while Spearman sits at
-  0.57-0.62. Reporting both makes that gap visible instead of flattering the result.
-* **sigma_pred / sigma_gold.** This is the column that exposed the original problem. A model
-  that has learned the marginal and nothing else produces a ratio near 0 while its
-  correlation may still look respectable; two of the predecessor's fields were literally
-  constant. Anything much below ~0.8 means the predictions are shrunk toward the mean.
+* **Spearman**, because Pearson is inflated by this corpus's skewed marginals.
+* **sigma_pred / sigma_gold**, which exposes variance collapse that a correlation can hide.
+* **Detection**, because Spearman here is largely a detection metric: see `spearman_ceiling`
+  and `detection_metrics`.
 
-`pearson` returns NaN when either side is constant, which is the honest answer and is
-exactly how the collapse showed up before. Do not paper over it with a zero.
+`pearson` returns NaN when either side is constant. That is the honest answer for a collapsed
+prediction and should not be papered over with a zero.
 """
 
 from __future__ import annotations
@@ -152,7 +147,7 @@ def transcription_metrics(
 
     Words are aligned positionally; a length mismatch counts every unmatched gold word as
     fully wrong rather than being skipped. Silently dropping misaligned words is how a
-    transcription number gets flattered, and the predecessor's phone correlation was
+    transcription number gets flattered, and the phone correlation is
     computed over only the 98% of words whose lengths happened to agree.
     """
     edits = edits_no_stress = phones_total = 0
@@ -180,17 +175,10 @@ def transcription_metrics(
 
 
 # --- detection ---------------------------------------------------------------------------
-# Spearman on this corpus is a detection metric in disguise. Decomposing the achievable SCC
-# on the test split shows where it actually lives:
-#
-#   phone.accuracy       perfect predictor (ceiling)                    0.680
-#                        perfect ceiling-vs-not, random ordering below  0.671   <- 99%
-#                        perfect ordering below, ceiling not detected   0.077   <-  1%
-#
-# So "improve the rank correlation" means "improve mispronunciation detection", and a
-# differentiable ranking loss would spend its gradient on orderings the metric cannot
-# reward. Reporting detection directly says so out loud instead of leaving it to be inferred
-# from a rank correlation.
+# On the test split, perfect ceiling-vs-not detection with random ordering below reaches
+# 0.671 of the 0.680 Spearman achievable on phone accuracy; perfect ordering without
+# detection reaches 0.077. Spearman here is therefore largely a detection metric, and is
+# reported as one.
 
 
 @dataclass(frozen=True, slots=True)

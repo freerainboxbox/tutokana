@@ -1,33 +1,17 @@
-"""Score heads: what reads the register hidden states, and how.
+"""Score heads reading register hidden states.
 
-Three design points, each of which is a deliberate departure from the obvious version.
+Each head takes a per-level learned softmax mixture over the last `n_layers` hidden states,
+initialised biased low for phone and high for utterance, then
+`RMSNorm -> Linear(512) -> GELU -> Dropout -> Linear(n_out)` in fp32. A register is read at
+its own position; the -1 shift belongs to language-model cross-entropy only.
 
-**Where to read.** Not the last layer. HMamba's architecture ablation is explicit that
-"phone-level and word-level scores should be predicted in lower layers" — its flat
-last-layer variant scores 0.694 phone correlation against 0.739 for the hierarchical one.
-`LayerMixture` therefore gives every level its own learned softmax over the hidden stack,
-initialised biased toward a lower band for phones and a higher one for utterances. The
-learned weights are also a free diagnostic: print them and you can see which depth the model
-actually found the signal at.
+Three output modes: `regression` (scalar), `soft_class` (logits over the label's discrete
+support, read out as an expectation) and `binary` (one logit).
 
-**No off-by-one.** The hidden state at index i already includes token i, so a register is
-read at its own position. The -1 shift belongs to language-model cross-entropy, which
-predicts the *next* token; applying it here would read the state of whatever precedes the
-register and quietly discard the register's own attention.
-
-**How to condition on the phone.** The obvious reading of "a head per phone" is 66
-independent heads. That is the wrong shape of the right idea: rare symbols get too few
-examples, no statistics are shared, and routing by the *gold* phone during training but the
-*emitted* phone at inference introduces a train/test skew. `film` buys the thing routing was
-actually reaching for — a per-phone difficulty prior — with two parameters per symbol, on
-top of a trunk trained on all the data at once. `concat` is the richer alternative: a learned
-per-symbol embedding appended to the hidden state, which lets the trunk itself behave
-differently per phone rather than only rescaling its output.
-
-Output modes are per level. `soft_class` exists because 80.1% of phone accuracy labels are
-exactly 2.0: a plain regressor under any pointwise loss drifts to the mode, whereas a
-distribution over the eleven-value support read out as an expectation stays continuous and
-takes class weighting naturally.
+Phone conditioning supplies a per-phone difficulty prior: `film` scales and shifts the output
+from a 2-parameter embedding, `concat` appends a 32-dimensional symbol embedding to the input.
+One head per symbol is deliberately not offered — rare phones would get too few examples and
+share no statistics.
 """
 
 from __future__ import annotations
@@ -262,7 +246,7 @@ def build_head_specs(
 
     `head_modes` is keyed by level; word stress always overrides to `binary` because a 99:1
     label split is a detection problem, not a regression one, and a regressor on it converges
-    to the constant 10 that made the predecessor's stress correlation undefined.
+    to a constant, which leaves the correlation undefined.
     """
     if phone_conditioning not in PHONE_CONDITIONING:
         raise ValueError(

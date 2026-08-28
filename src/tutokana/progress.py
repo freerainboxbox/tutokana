@@ -1,17 +1,12 @@
-"""Progress reporting: a live bar on the console, verbose lines in the log file.
+"""Progress reporting: a live bar on the console, detail lines in the log file.
 
-The two audiences want opposite things. Watching a four-hour eval you want one line that
-updates in place; reading the log afterwards you want a timestamped record you can diff and
-plot, and a thousand carriage returns in a file are worthless. So the bar is written straight
-to the terminal and never goes through `logging`, while the periodic detail line is logged
-with `file_only=True` and filtered out of the console handler by `config.run_logging`.
+The bar is written straight to the terminal and never goes through `logging`; the periodic
+detail line is logged with `file_only=True` and filtered off the console by
+`config.run_logging`. A log full of carriage returns is worthless, and a bar that scrolls
+away is useless.
 
-Rates are reported over a sliding window rather than cumulatively. The predecessor's eval
-printed `seen / total_elapsed`, which is an average: when throughput collapsed 73x over four
-hours the printed number drifted from 3.5/s to 0.2/s and never showed how bad the tail
-actually was (0.067/s). A windowed rate shows degradation while it is happening, which is the
-only time the number is actionable. ETA follows the same window, smoothed, so it responds to
-a slowdown instead of quietly under-promising for an hour.
+Rates are windowed rather than cumulative, so a slowdown is visible while it is happening,
+and are withheld until the window spans `MIN_SPAN` seconds.
 """
 
 from __future__ import annotations

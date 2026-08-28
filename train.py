@@ -1,21 +1,16 @@
 """Train tutokana on speechocean762.
 
-Fine-tunes `google/gemma-4-12B-it` with LoRA plus score-register heads. The assistant turn
-carries a word and phoneme transcript with a dedicated register token at every score
-position; the scores themselves never appear as text, they are read out of the hidden state
-at those registers by small regression heads. See `src/tutokana/prompting.py` for the exact
-layout and `src/tutokana/losses.py` for why the objective looks the way it does.
+Fine-tunes Gemma 4 12B with LoRA plus score-register heads. The assistant turn carries a word
+and phoneme transcript with a register token at every score position; the scores are read out
+of the hidden state at those registers rather than generated as text.
 
-    python train.py                          # full run, all three levels
-    python train.py --train-probe 400        # short run for hyperparameter iteration
-    python train.py --data-levels utterance  # the joint-prediction ablation
-    python train.py --lambda-ccc 0           # pointwise loss only, no correlation term
+    python train.py                          # current best configuration
+    python train.py --train-probe 400        # short run for iteration
+    python train.py --resume <run-id>        # continue an interrupted run
+    python train.py --lambda-detect 0        # ablate the detection term
 
-Every run writes to `runs/<run_id>/` (adapter, heads, target statistics, config) and logs to
-`logs/train-<run_id>-<completion timestamp>.log` alongside the console.
-
-The base weights are downloaded to the standard Hugging Face cache, never into the repo; set
-HF_HOME to move it.
+Ctrl-C finishes the current step, checkpoints, and prints the resume command. Every run writes
+to `runs/<run_id>/` and logs to `logs/train-<run_id>-<completion>.log`.
 """
 
 from __future__ import annotations
@@ -110,9 +105,8 @@ def main() -> None:
     args, explicit = parse_args()
     config = cfg.config_from_args(args)
 
-    # A resumed run is defined entirely by its saved config: the mix, the speaker split, the
-    # per-epoch shuffles and the schedule shape are all deterministic functions of it, so
-    # honouring a conflicting flag now would continue a different run than the one on disk.
+    # The mix, splits, shuffles and schedule are deterministic functions of the saved
+    # config, so a conflicting flag would silently continue a different run.
     resume_meta = resume_state = None
     if args.resume:
         if args.run_id:
@@ -247,11 +241,8 @@ def main() -> None:
         log.info("[train] %d steps (%d/epoch x %d epochs)",
                  total_steps, steps_per_epoch, config.train.epochs)
 
-        # Everything except the random streams is restored *before* preflight, so preflight
-        # exercises the state a resumed run will actually train with — a restored buffer
-        # holds host-side tensors, and concatenating those with an accelerator batch used to
-        # segfault on the first step with no traceback. The RNG comes after, because
-        # preflight's own dropout would otherwise consume the stream being restored.
+        # Restored before preflight so preflight exercises the state training will use; the
+        # RNG comes after, since preflight's dropout would consume the stream being restored.
         start_epoch, start_sample, step = 0, 0, 0
         if resume_state is not None:
             optimizer.load_state_dict(resume_state["optimizer"])

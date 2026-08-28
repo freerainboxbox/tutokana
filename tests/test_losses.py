@@ -263,8 +263,8 @@ def test_pos_weight_raises_the_cost_of_missing_a_mispronunciation():
     torch.testing.assert_close(plain, weighted)
 
 
-def test_detection_term_is_off_by_default_and_added_when_enabled(utterances):
-    """It is an experiment arm, so the control is the existing default."""
+def test_detection_term_is_on_by_default_and_removable(utterances):
+    """It is the default configuration; --lambda-detect 0 is the ablation arm."""
     from tutokana.collate import HeadBatch
     from tutokana.data import compute_target_stats
     from tutokana.heads import HeadBank, build_head_specs
@@ -278,8 +278,8 @@ def test_detection_term_is_off_by_default_and_added_when_enabled(utterances):
         positions=torch.zeros(6, 2, dtype=torch.long), target=torch.randn(6),
         raw=torch.tensor([2.0, 2.0, 1.6, 2.0, 0.4, 2.0]))}
 
-    _, off = composite_loss(bank, logits, heads, LossConfig())
-    _, on = composite_loss(bank, logits, heads, LossConfig(lambda_detect=0.5))
-    assert "detect/phone.accuracy" not in off
+    _, on = composite_loss(bank, logits, heads, LossConfig())
+    _, off = composite_loss(bank, logits, heads, LossConfig(lambda_detect=0.0))
     assert "detect/phone.accuracy" in on
+    assert "detect/phone.accuracy" not in off
     assert on["loss/total"] > off["loss/total"]

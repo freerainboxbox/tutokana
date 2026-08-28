@@ -1,24 +1,12 @@
-"""Batching: text + audio in, register positions and per-head targets out.
+"""Batching: audio, padding, register positions and per-head targets.
 
-The one subtle thing here is how register positions are located. Rather than tracking
-character offsets through the audio-expanded prompt (fragile, and the source of a whole
-class of silent misalignment bugs), the collator renders the target, tokenizes normally,
-then *scans* `input_ids` for register token ids. Because every register is an atomic
-special token, the k-th occurrence of a given register id is necessarily the k-th slot of
-that register in emission order — so zipping the scan against `prompting.render_target`'s
-declared slot list is exact, and any disagreement in count or order raises here instead of
-mislabelling scores for an entire run.
+Register positions are found by scanning `input_ids` for the register ids and zipping them
+against the slots the renderer declared; a mismatch raises immediately rather than
+mislabelling silently.
 
-Loss masking follows the same "find the landmark" principle. The generation prompt always
-ends with `<channel|>` (id 101, the close of the empty thought block), and that token cannot
-occur anywhere else in the rendered text, so it marks the prompt/completion boundary
-exactly. Everything up to and including it is masked out of the language-model
-cross-entropy, which also excludes every audio token for free.
-
-That last point is not a nicety. The predecessor once trained a functionally deaf model —
-identical output for real, zeroed, noised and swapped audio — because ~10% of its supervised
-tokens were audio placeholders whose label is the constant `<|audio|>` id, and that constant
-target collapsed the representations at exactly the positions carrying the speech.
+Language-model cross-entropy is masked off register positions *and* audio positions. Audio
+masking is not optional: supervising the constant `<|audio|>` id collapses the
+representations at exactly the positions carrying speech, producing a model that cannot hear.
 """
 
 from __future__ import annotations

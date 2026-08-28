@@ -1,22 +1,18 @@
 """Training and scoring loops.
 
-Two things here are worth explaining rather than reading off the code.
+**Preflight** checks every invariant that fits in one micro-batch before a multi-hour run:
+audio features present, registers located per level, no NaN or unbounded targets, and a
+backward pass reaching every head. A head with no gradient is a head whose registers were
+never found.
 
-**Preflight.** A full run is measured in tens of hours, so every invariant that can be
-checked in one micro-batch is checked before the first optimizer step: audio features
-present, at least one register located per level, no NaN targets, and — the one that
-actually caught a bug in the predecessor — a backward pass that reaches every head. A head
-that receives no gradient is a head whose registers were never found, and finding that out
-at hour thirty is expensive.
+**Validation measures correlation, not loss.** Scoring is one teacher-forced forward pass, so
+a few hundred samples cost a couple of minutes and report per-level correlation and
+sigma_pred/sigma_gold — which is what catches variance collapse early. The slice is
+speaker-disjoint from training; the test split is never touched here.
 
-**Validation measures correlation, not loss.** The predecessor ran a validation *loss* pass
-that its own documentation admitted was incomparable across configurations. Cross-entropy on
-the transcript is not the objective any more, and now that the scores live in heads the real
-metric costs one teacher-forced forward pass with no generation — a few hundred samples in
-a couple of minutes. So validation reports per-level correlation and the
-sigma_pred/sigma_gold ratio, which is what catches variance collapse at step 200 instead of
-after the run. The slice is speaker-disjoint from what is trained on; the test split is
-never touched here.
+**Resume** stores what continuing needs: optimizer moments, schedule position, RNG streams,
+the correlation buffer and the epoch/sample offset. Everything else — mix, splits, epoch
+orders, target statistics — is recomputed from the saved config.
 """
 
 from __future__ import annotations
@@ -276,13 +272,6 @@ def build_scheduler(optimizer, total_steps: int, warmup_ratio: float):
 
 
 # --- interruption and resume ----------------------------------------------------------
-# Interrupting is only half of it. A resume is *clean* when continuing produces the same
-# trajectory the uninterrupted run would have had, which needs more than the weights:
-# optimizer moments, the schedule position, the random streams that drive shuffling and
-# dropout, the correlation buffer's population, and where in the epoch the run stopped.
-# Everything else — the training mix, the speaker split, the epoch orders, the target
-# statistics — is a deterministic function of the saved config, so it is recomputed rather
-# than stored.
 
 RESUME_META = "resume.json"
 RESUME_STATE = "resume_state.pt"

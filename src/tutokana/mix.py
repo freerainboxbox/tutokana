@@ -1,37 +1,9 @@
-"""Training-mix construction: entropy-greedy oversampling + synthetic negatives.
+"""Training mix: entropy-greedy oversampling plus synthetic negatives.
 
-Ported from the predecessor's `training_mix.py`, whose measurements still hold: 80.1% of
-train phone scores are 2.0, 88.0% of word accuracies are 10, and only 20.8% of utterances
-contain any mispronunciation. Trained on that marginal, a model predicts near-constant high
-scores and rates audio that does not match the transcript at roughly 8/10 — which is exactly
-what the predecessor's evaluation showed.
-
-Two deterministic constructions, both pure functions of (seed, k, n_negatives):
-
-1. `compute_multiplicities` — every utterance appears at least once and at most k times per
-   epoch, with integer multiplicities chosen by greedy entropy maximisation over the phone
-   score class distribution. The objective is concave in the class counts, so greedy
-   increments are near-optimal. k=5 sits at the measured knee: epoch 2500 -> ~4016 samples
-   (1.61x time), normalised phone-class entropy 0.32 -> 0.56, share of the epoch containing
-   a mispronunciation 21% -> 45%. Past k~8 the gain per unit of training time falls off and
-   per-sample repetition starts risking memorisation.
-
-2. `sample_negatives` — transcript of utterance A paired with audio of utterance B, where A
-   and B share no words. Every label is then known by construction rather than judged (the
-   corpus paper's own baseline makes the same move at phone level). Per the annotation
-   rubric: completeness 0.0 (definitionally, no target word is pronounced); every phone
-   score 0.0 ("incorrect or missed"); word accuracy/total in the "word is missed" band
-   {0,1}; utterance accuracy/total in the "unable to understand" band {0,1,2} via ONE
-   severity draw per pair so the fields stay coherent; fluency and prosodic carried from B's
-   gold, because the delivery really is B's — which also teaches that the dimensions are
-   separable (fluent speech, wrong content). Mispronunciation lists stay empty: nothing was
-   attempted, so the words are "missed", not mispronounced.
-
-Note this module classifies phone scores into {0,1,2} by rounding *for the entropy
-objective only*. That is a coarsening of the sampling signal, not of the labels — the
-continuous 0.2-spaced values are what the heads are trained on (see data.py).
-
-Importable with no side effects.
+80.1% of phone accuracies are exactly 2.0 and 88.0% of word accuracies are exactly 10, so the
+raw split is dominated by correct speech. `compute_multiplicities` greedily repeats
+utterances to maximise phone-class entropy, and `sample_negatives` pairs transcripts with
+mismatched audio using disjoint word sets to manufacture unambiguous mispronunciations.
 """
 
 from __future__ import annotations

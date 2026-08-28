@@ -1,21 +1,12 @@
-"""The model: Gemma 4 with LoRA, a register embedding delta, and the score heads.
+"""Model assembly: Gemma 4 + LoRA + register delta + heads.
 
-`google/gemma-4-12B-it` is unusual in a way that simplifies this a lot: **its audio path is
-encoder-free**. The only audio tensor in the checkpoint is
-`model.embed_audio.embedding_projection.weight`, shape [3840, 640]. With 640 samples per
-token at 16 kHz, a raw 40 ms waveform frame is projected straight into the language model's
-embedding space — there is no mel spectrogram, no conformer tower, and the 48 decoder layers
-*are* the acoustic model. So LoRA on the language layers already adapts the acoustic
-pathway, and `train_audio_projection` opens up the single 2.46 M-parameter front-end matrix
-as an ablation rather than as a necessity. (E2B/E4B do keep a conformer tower; conclusions
-about the front end will not transfer between them.)
+The audio path is encoder-free — a raw 40 ms frame is projected straight into the embedding
+space — so LoRA on the language layers is also the acoustic adapter.
 
-`RegisterDelta` exists because of how the registers are trained. They are never sampled —
-their positions are structurally determined and force-fed — so only their *input* embedding
-matters, not their logit. Making the tied 262144 x 3840 embedding matrix trainable to move a
-dozen rows would cost a gigabyte of optimiser state to update 0.005% of it. A zero-init
-(K, 3840) additive delta at register positions does the same job for ~50 K parameters, and
-starts training exactly at the pretrained rows, which already have unit norm.
+Registers are force-fed at inference rather than sampled, so only their *input* embedding
+matters. `RegisterDelta` is a trainable (K, hidden) tensor added at register positions via a
+forward hook on the embedding module, zero-initialised. The hook is necessary because the
+multimodal path needs `input_ids` to scatter audio and cannot take `inputs_embeds`.
 """
 
 from __future__ import annotations
@@ -133,13 +124,12 @@ class TutokanaModel(nn.Module):
     def forward(
         self, batch: dict, *, with_lm_loss: bool = True
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
-        """Read every head from one pass. `with_lm_loss=False` skips the text objective.
+        """Read every head from one pass.
 
-        That flag is worth its weight in memory. Passing `labels` makes the base model
-        materialise logits over the whole 262144-token vocabulary — 5.5 GB in fp32 at batch
-        8, sequence 700, scaling linearly with both. Scoring throws that loss away, so the
-        largest single allocation in an eval pass existed only to be discarded, and because
-        it scales with sequence length it grew as the split's utterances got longer.
+        `with_lm_loss=False` skips the text objective, which scoring discards anyway. Passing
+        `labels` materialises logits over the full 262144-token vocabulary — 5.5 GB in fp32
+        at batch 8, sequence 700, scaling with both — so this is the difference between an
+        eval pass measured in minutes and one measured in hours.
         """
         input_ids = batch["input_ids"]
         model_kwargs = {
@@ -171,9 +161,7 @@ class TutokanaModel(nn.Module):
         return trainable, total
 
     # -- persistence -----------------------------------------------------------------
-    # Only the trained parts are saved. The base weights stay in the Hub cache; a run
-    # directory is a few hundred megabytes of adapter plus a few of heads, so keeping runs
-    # around costs almost nothing.
+    # Only the trained parts; base weights stay in the Hub cache.
 
     def save(self, run_dir: Path) -> None:
         from safetensors.torch import save_file

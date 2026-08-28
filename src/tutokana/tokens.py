@@ -1,28 +1,10 @@
-"""The register-token table — the single source of truth for tutokana's vocabulary.
+"""Score-register tokens.
 
-Scores do not appear in the text the model emits. Every score position is instead a
-*register*: a token whose only job is to exist at a known index so a regression head can
-read the hidden state there. Gemma 4 ships 6227 `<unusedN>` entries (2.4% of a 262144
-vocabulary), so registers cost no embedding growth at all.
-
-Two facts make this work, both verified against the real tokenizer rather than assumed:
-
-  1. `<unusedN>` strings are present in `model.vocab` but NOT in `added_tokens`, so out of
-     the box `"<unused0>"` tokenizes as ['<', 'unused', '0', '>'] — four tokens, not one.
-     `register_tokens()` fixes that with `add_tokens(..., special_tokens=True)`.
-  2. Doing so does NOT grow the vocabulary: `len(tokenizer)` stays 262144 and the ids stay
-     put, because the rows already exist. No `resize_token_embeddings`, ever. The unused
-     rows are not zero either (norm ~1.00 vs ~1.03-1.14 for ordinary ids), so they are
-     usable as-is and a zero-initialised delta on top starts training from the pretrained
-     point (see model.RegisterDelta).
-
-AVOID `<unused8>` (id 14): it is a known llama.cpp degenerate-loop trigger for Gemma 4
-(ggml-org/llama.cpp#21321, #21516). The table below skips it, which is why the utterance
-registers are not a contiguous `<unused5..8>` run.
-
-Ordering is load-bearing. The assistant turn is bottom-up under causal masking — phones,
-then that word's registers, then, after every word, the utterance registers with
-UTT_TOTAL last so it can attend to the other three.
+Eleven unused Gemma 4 vocabulary entries are registered as atomic special tokens and used as
+structural landmarks in the assistant turn: one per phone, three per word, four per
+utterance, plus separators. Registering them leaves `len(tokenizer)` at 262144, so there is
+no embedding resize and no id drift. `<unused8>` (id 14) is skipped — it is a known
+llama.cpp degenerate-loop trigger for Gemma 4.
 """
 
 from __future__ import annotations

@@ -22,7 +22,7 @@ def test_pearson_matches_numpy():
 
 
 def test_pearson_is_nan_for_a_constant_prediction():
-    """This is how the predecessor's collapsed fields showed up. Do not paper over it."""
+    """NaN is how a collapsed field shows up. Do not paper over it with a zero."""
     assert np.isnan(pearson(np.full(50, 10.0), np.arange(50, dtype=float)))
 
 
