@@ -247,3 +247,15 @@ def test_snapping_table_survives_a_field_that_collapses():
     snapped = {"word.stress": field_metrics(snap_to_support(pred, [5.0, 10.0]), gold,
                                             bootstrap=False)}
     assert "nan" in render_snapping(raw, snapped)  # renders rather than raising
+
+
+def test_two_value_grids_are_not_worth_snapping():
+    """Snapping onto {5, 10} is a threshold, not a rounding: word.stress predictions are
+    9.97 +- 0.29, so every one lands on 10 and the correlation becomes undefined. The
+    resulting NaN is correct but useless, so evaluate.py skips such fields."""
+    grid = [5.0, 10.0]
+    pred = 9.97 + np.random.default_rng(0).normal(0, 0.29, 2000)
+    assert len(np.unique(snap_to_support(pred, grid))) == 1
+    gold = np.array([10.0] * 1984 + [5.0] * 16)
+    assert field_metrics(snap_to_support(pred, grid), gold, bootstrap=False).pearson != \
+           field_metrics(snap_to_support(pred, grid), gold, bootstrap=False).pearson  # NaN

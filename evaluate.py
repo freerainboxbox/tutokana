@@ -238,10 +238,22 @@ def main() -> None:
                     "written to target_stats.json, so those fields are left unsnapped",
                     ", ".join(sorted(missing)),
                 )
+            # A two-point grid is not a grid. Snapping a continuous score onto {5, 10} is
+            # thresholding, which destroys the ranking outright: every stress prediction
+            # lands on 10, the field becomes constant, and its correlation is undefined.
+            binary_grid = [
+                k for k in result.predictions
+                if len((stats.support or {}).get(k, ())) <= 2
+            ]
+            if binary_grid:
+                log.info(
+                    "[snap] skipping %s — a two-value support makes snapping a threshold, "
+                    "not a rounding", ", ".join(sorted(binary_grid)),
+                )
             snapped = {
                 key: snap_to_support(values, stats.support[key])
                 for key, values in result.predictions.items()
-                if key in (stats.support or {})
+                if key in (stats.support or {}) and key not in binary_grid
             }
             snapped_metrics = {
                 key: field_metrics(values, result.gold[key], bootstrap=False)
