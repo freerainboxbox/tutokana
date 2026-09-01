@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from tutokana.collate import IGNORE_INDEX, Collator, head_key
-from tutokana.data import compute_target_stats, phone_vocabulary, stress_binary
+from tutokana.data import compute_target_stats, phone_vocabulary
 from tutokana.prompting import TargetSpec
 
 AUDIO_TOKENS_PER_SAMPLE = 4
@@ -86,7 +86,9 @@ def test_targets_carry_the_right_values(collator, utterance):
     assert phone.raw.tolist() == pytest.approx(expected)
 
     stress = batch["heads"][head_key("word", "stress")]
-    assert stress.raw.tolist() == [stress_binary(w.stress) for w in utterance.words]
+    # `raw` is what the head is trained on, `native` what the metrics report.
+    assert stress.raw.tolist() == [float(w.stress_votes) for w in utterance.words]
+    assert stress.native.tolist() == [w.stress for w in utterance.words]
 
     accuracy = batch["heads"][head_key("utterance", "accuracy")]
     assert accuracy.raw.tolist() == [utterance.accuracy]
@@ -96,7 +98,7 @@ def test_targets_are_z_scored(collator, utterance):
     batch = collator([utterance])
     key = head_key("phone", "accuracy")
     head_batch = batch["heads"][key]
-    expected = (head_batch.raw - collator.stats.mean[key]) / collator.stats.std[key]
+    expected = (head_batch.native - collator.stats.mean[key]) / collator.stats.std[key]
     assert torch.allclose(head_batch.target, expected)
 
 
@@ -151,7 +153,8 @@ def test_padding_is_excluded_from_the_language_loss(collator, utterances):
     short = replace(utterances[0], words=utterances[0].words[:1], text="WE")
     long = replace(
         utterances[1],
-        words=utterances[1].words + (Word("BIRD", 4.0, 10.0, 4.0, ("B", "ER1", "D"), (2.0, 0.4, 0.0)),),
+        words=utterances[1].words
+        + (Word("BIRD", 4.0, 10.0, 5, 4.0, ("B", "ER1", "D"), (2.0, 0.4, 0.0)),),
         text="WE CALL BIRD",
     )
     batch = collator([short, long])

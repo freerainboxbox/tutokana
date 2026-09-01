@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tutokana.data import SAMPLE_RATE, Utterance, Word
+from tutokana.data import SAMPLE_RATE, Utterance, Word, stress_median
 
 #: The Gemma 4 tokenizer, if a snapshot happens to be in the local Hub cache. Tests that
 #: need real tokenization skip cleanly when it is not — the rest of the suite still runs.
@@ -79,7 +79,10 @@ def make_utterance(
             Word(
                 text=text,
                 accuracy=float(10 - 2 * ((cursor + position) % 4)),
-                stress=10.0 if (cursor + position) % 7 else 5.0,
+                # Votes spread over the panel so the fixtures exercise the whole 0-5
+                # support; the released label is their median, exactly as in the corpus.
+                stress=stress_median((cursor + position) % 6),
+                stress_votes=(cursor + position) % 6,
                 total=float(10 - 2 * ((cursor + position) % 4)),
                 phones=phones,
                 phone_accuracy=scores,

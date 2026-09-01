@@ -66,7 +66,10 @@ def make_negative(a: Utterance, b: Utterance, rng: random.Random) -> Utterance:
         Word(
             text=w.text,
             accuracy=(0.0 if severity == 0 else float(rng.choice([0, 1]))),
-            stress=10.0,  # the dataset's default where stress is unratable
+            # The dataset's default where stress is unratable, stated as a clean sweep of
+            # the annotator panel so the stress head sees the same label shape as real words.
+            stress=10.0,
+            stress_votes=5,
             total=(0.0 if severity == 0 else float(rng.choice([0, 1]))),
             phones=w.phones,  # canonical phones are transcript-derived, so A's stand
             phone_accuracy=(0.0,) * len(w.phones),

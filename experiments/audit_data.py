@@ -9,7 +9,8 @@ one minute rather than as an unexplained result three days later.
 Expected on the train split, as measured 2026-08-26:
   phone accuracy    11 distinct values in 0.2 steps, 80.1% at 2.0   (NOT the {0,1,2} rubric)
   word accuracy     88.0% at 10, and the value 4 never occurs
-  word stress       99.0% at 10
+  word stress       99.0% at 10 released, but only 80.0% a clean sweep of the 5 experts
+                    panel concentration nu = 8.6, the value the stress head is built with
   completeness      99.6% at 10.0, sigma 0.11                       (measured, never trained)
   audio             mean 4.1 s, p95 8.1 s, max 20.4 s -> ~100 audio tokens median
 """
@@ -26,7 +27,44 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tutokana.data import SAMPLE_RATE, load_split, phone_vocabulary, stress_binary
+from tutokana.data import STRESS_RATERS, SAMPLE_RATE, load_split, phone_vocabulary
+
+
+def stress_panel(votes: Counter, n_raters: int) -> dict:
+    """Moment-match the per-word agreement rate p behind the panel's vote counts.
+
+    p is never observed — only k, how many of the `n_raters` experts called the stress
+    correct. Its spread is still recoverable, because the variance of k splits into two
+    parts that do not overlap:
+
+        Var(k) = n*p_bar*(1 - p_bar)  +  n*(n - 1)*Var(p)
+                 \________________/      \_____________/
+                  the panel disagreeing    words genuinely
+                  even at a fixed rate     differing in p
+
+    The first term is what five people would produce on their own, and it is a closed form.
+    Whatever variance is left over is the second term. Solving for Var(p) and matching it to
+    a Beta, whose variance is m*(1 - m)/(nu + 1), gives the concentration in one step.
+    `config.stress_concentration` is this number, held fixed rather than learned.
+    """
+    k = np.repeat(
+        np.array(sorted(votes), dtype=float), [votes[v] for v in sorted(votes)]
+    )
+    p_bar = float(k.mean()) / n_raters
+    independent = n_raters * p_bar * (1.0 - p_bar)
+    var_p = (float(k.var()) - independent) / (n_raters * (n_raters - 1))
+    concentration = p_bar * (1.0 - p_bar) / var_p - 1.0
+    return {
+        "p_bar": p_bar,
+        "var_k": float(k.var()),
+        "var_k_if_p_were_constant": independent,
+        "var_p": var_p,
+        "concentration": concentration,
+        # How much wider the counts spread than independent experts would manage, and the
+        # panel size that spread is really worth.
+        "design_effect": float(k.var()) / independent,
+        "effective_raters": n_raters * independent / float(k.var()),
+    }
 
 
 def audit(split: str, limit: int | None) -> dict:
@@ -35,10 +73,12 @@ def audit(split: str, limit: int | None) -> dict:
     phone_scores = Counter()
     word_accuracy = Counter()
     word_stress = Counter()
+    stress_votes = Counter()
     for u in utterances:
         for w in u.words:
             word_accuracy[w.accuracy] += 1
             word_stress[w.stress] += 1
+            stress_votes[w.stress_votes] += 1
             phone_scores.update(w.phone_accuracy)
 
     utterance_fields = {}
@@ -74,10 +114,14 @@ def audit(split: str, limit: int | None) -> dict:
             "histogram": {str(k): v for k, v in sorted(word_accuracy.items())},
         },
         "word_stress": {
-            "share_correct": sum(
-                stress_binary(k) * v for k, v in word_stress.items()
-            ) / max(sum(word_stress.values()), 1),
+            "share_correct": word_stress[10.0] / max(sum(word_stress.values()), 1),
             "histogram": {str(k): v for k, v in sorted(word_stress.items())},
+            # The released label is the median of five experts, so it hides every split
+            # verdict. The vote histogram is the target the stress head is trained on.
+            "share_unanimous": stress_votes[STRESS_RATERS]
+            / max(sum(stress_votes.values()), 1),
+            "vote_histogram": {str(k): v for k, v in sorted(stress_votes.items())},
+            "panel": stress_panel(stress_votes, STRESS_RATERS),
         },
         "audio": {
             "mean_s": float(durations.mean()),
@@ -93,6 +137,7 @@ def audit(split: str, limit: int | None) -> dict:
 def report(result: dict) -> str:
     utterance = result["utterance_fields"]
     audio = result["audio"]
+    panel = result["word_stress"]["panel"]
     lines = [
         f"=== speechocean762 / {result['split']} ===",
         f"{result['utterances']} utterances, {result['speakers']} speakers, "
@@ -114,7 +159,14 @@ def report(result: dict) -> str:
         + ("  <-- continuous, NOT {0,1,2}" if phone["distinct_values"] > 3 else ""),
         f"  {phone['histogram']}",
         f"word accuracy:  {result['word_accuracy']['share_at_10']:.1%} at 10",
-        f"word stress:    {result['word_stress']['share_correct']:.1%} correct",
+        f"word stress:    {result['word_stress']['share_correct']:.1%} released correct, "
+        f"{result['word_stress']['share_unanimous']:.1%} unanimous across the 5 experts",
+        f"  votes {result['word_stress']['vote_histogram']}",
+        f"  panel: p {panel['p_bar']:.4f}, Var(k) {panel['var_k']:.4f} against "
+        f"{panel['var_k_if_p_were_constant']:.4f} at a fixed rate",
+        f"         concentration nu {panel['concentration']:.2f}, "
+        f"{panel['effective_raters']:.2f} of {STRESS_RATERS} experts' worth of "
+        f"independent information",
         "",
         f"audio: mean {audio['mean_s']:.2f}s  p50 {audio['p50_s']:.2f}s  "
         f"p95 {audio['p95_s']:.2f}s  max {audio['max_s']:.2f}s",

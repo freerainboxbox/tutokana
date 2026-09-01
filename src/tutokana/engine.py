@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from .config import get_logger
-from .data import Utterance, from_binary_stress
+from .data import Utterance
 from .losses import LossConfig, composite_loss
 from .metrics import FieldMetrics, field_metrics
 from .progress import Progress, memory_note
@@ -200,12 +200,9 @@ def score(
         for key, logits in head_outputs.items():
             head = model.heads.head(key)
             prediction = head.predict_native(logits).float().cpu().numpy()
-            gold = batch["heads"][key].raw.float().cpu().numpy()
-            if key == "word.stress":
-                # Reported on the corpus's 5-10 scale so the number lines up with published
-                # tables; correlation is unchanged by the affine map.
-                prediction = np.vectorize(from_binary_stress)(prediction)
-                gold = np.vectorize(from_binary_stress)(gold)
+            # `native`, not `raw`: word stress trains on the annotator vote count but is
+            # reported on the corpus's published 5-10 median, as the baselines are.
+            gold = batch["heads"][key].native.float().cpu().numpy()
             collected.setdefault(key, []).append((prediction, gold))
         scored += len(chunk)
         if progress is not None:

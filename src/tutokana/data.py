@@ -11,12 +11,16 @@ thousands.
 `TargetStats.support` records the values each label actually takes. Predictions can be
 rounded back onto that grid at eval (`evaluate.py --snap`); it must be the *training* grid,
 since deriving it from the split under evaluation would be reading that split's labels.
+
+Word stress additionally carries `Word.stress_votes`, the five experts' individual verdicts
+recovered from the corpus's `scores-detail.json`. See the README's "Word stress" note.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
@@ -25,6 +29,18 @@ import numpy as np
 
 DATASET_ID = "mispeech/speechocean762"
 SAMPLE_RATE = 16000
+
+#: Every utterance is scored by five experts independently. HuggingFace ships only the
+#: aggregate; the individual verdicts live in the corpus's own repository.
+STRESS_RATERS = 5
+_CORPUS_RAW = "https://raw.githubusercontent.com/jimbozhang/speechocean762/master"
+STRESS_DETAIL_URL = f"{_CORPUS_RAW}/resource/scores-detail.json"
+SPLIT_INDEX_URL = _CORPUS_RAW + "/{split}/text"
+
+#: Beta-binomial concentration for the five stress verdicts, by moment matching on the
+#: training split: Var(k) = n*p*(1-p) + n*(n-1)*Var(p) gives Var(p) = 0.0052 about a mean
+#: p of 0.947, hence nu = p*(1-p)/Var(p) - 1 = 8.63. Held fixed; see README.
+STRESS_CONCENTRATION = 8.6
 
 #: Field ranges on their native scales, used for soft-class supports and sanity checks.
 FIELD_RANGE: dict[tuple[str, str], tuple[float, float]] = {
@@ -37,13 +53,6 @@ FIELD_RANGE: dict[tuple[str, str], tuple[float, float]] = {
     ("word", "stress"): (5.0, 10.0),
     ("word", "total"): (0.0, 10.0),
     ("phone", "accuracy"): (0.0, 2.0),
-}
-
-#: The scale each field is actually *trained* on. Identical to FIELD_RANGE except word
-#: stress, which is carried as binary {0,1} (see `stress_binary`).
-TRAINING_RANGE: dict[tuple[str, str], tuple[float, float]] = {
-    **FIELD_RANGE,
-    ("word", "stress"): (0.0, 1.0),
 }
 
 #: Smallest standard deviation used for z-scoring, as a fraction of the field's span. A
@@ -66,9 +75,17 @@ FIELD_SUPPORT: dict[tuple[str, str], tuple[float, ...]] = {
 
 @dataclass(frozen=True, slots=True)
 class Word:
+    """One scored word.
+
+    `stress` is the released label, which is the *median* of the five experts' {5, 10}
+    verdicts and therefore takes only those two values. `stress_votes` is how many of the
+    five judged the stress correct, 0-5, which is the label the head is trained on.
+    """
+
     text: str
     accuracy: float
     stress: float
+    stress_votes: int
     total: float
     phones: tuple[str, ...]
     phone_accuracy: tuple[float, ...]
@@ -107,34 +124,85 @@ class Utterance:
         }
 
 
-def stress_binary(stress: float) -> float:
-    """5/10 -> 0/1, where 1 means the stress position is correct (or monosyllabic)."""
-    return 1.0 if stress >= 7.5 else 0.0
+def stress_median(votes: int) -> float:
+    """The released 5/10 label: the median of the five experts' {5, 10} verdicts.
+
+    A word is released as 10 ("stress correct, or monosyllabic") as soon as three of the
+    five say so, which is why the published label has no intermediate values.
+    """
+    return 10.0 if 2 * votes > STRESS_RATERS else 5.0
 
 
-def from_binary_stress(p: float) -> float:
-    """Inverse of stress_binary on the expectation, back onto the reported 5-10 scale."""
-    return 5.0 + 5.0 * p
+def _cache_dir() -> Path:
+    """Where the corpus-repository files land — the Hugging Face cache, never the repo."""
+    root = os.environ.get("HF_HOME")
+    return (Path(root) if root else Path.home() / ".cache" / "huggingface") / "tutokana"
 
 
-def to_utterance(row: dict, index: int) -> Utterance:
+def _fetch(url: str, name: str) -> Path:
+    """Download `url` once, atomically, and return the cached path."""
+    path = _cache_dir() / name
+    if path.exists():
+        return path
+    from urllib.request import urlopen
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(path.suffix + ".partial")
+    with urlopen(url) as response:
+        partial.write_bytes(response.read())
+    partial.rename(path)  # a half-written file must never be mistaken for a cached one
+    return path
+
+
+def load_stress_votes(split: str) -> list[tuple[int, ...]]:
+    """Per-word counts of experts who judged the stress correct, in split order.
+
+    HuggingFace ships the aggregated `scores.json` only, so the five individual verdicts
+    come from the corpus repository. Neither file carries an utterance id into the
+    HuggingFace rows, so alignment is positional against the official split index and is
+    verified against the aggregate in `load_split` rather than trusted.
+    """
+    detail = json.loads(_fetch(STRESS_DETAIL_URL, "scores-detail.json").read_text())
+    index = _fetch(SPLIT_INDEX_URL.format(split=split), f"{split}-text").read_text()
+    ids = [line.split("\t", 1)[0] for line in index.splitlines() if line.strip()]
+    return [
+        tuple(
+            sum(1 for v in word["stress"] if v == 10.0) for word in detail[key]["words"]
+        )
+        for key in ids
+    ]
+
+
+def to_utterance(row: dict, index: int, stress_votes: tuple[int, ...]) -> Utterance:
     """Flatten one raw dataset row. Audio is copied to float32 once, here and nowhere else."""
+    if len(stress_votes) != len(row["words"]):
+        raise ValueError(
+            f"row {index}: {len(row['words'])} words but {len(stress_votes)} vote counts "
+            f"— the split index and the HuggingFace rows are out of order"
+        )
     words = tuple(
         Word(
             text=w["text"],
             accuracy=float(w["accuracy"]),
             stress=float(w["stress"]),
+            stress_votes=int(votes),
             total=float(w["total"]),
             phones=tuple(w["phones"]),
             phone_accuracy=tuple(float(a) for a in w["phones-accuracy"]),
         )
-        for w in row["words"]
+        for w, votes in zip(row["words"], stress_votes)
     )
     for w in words:
         if len(w.phones) != len(w.phone_accuracy):
             raise ValueError(
                 f"row {index} word {w.text!r}: {len(w.phones)} phones but "
                 f"{len(w.phone_accuracy)} phone scores"
+            )
+        if stress_median(w.stress_votes) != w.stress:
+            raise ValueError(
+                f"row {index} word {w.text!r}: {w.stress_votes}/5 experts scored the "
+                f"stress correct, whose median is {stress_median(w.stress_votes)}, but the "
+                f"released label is {w.stress} — the vote file is misaligned with the split"
             )
     return Utterance(
         index=index,
@@ -159,8 +227,14 @@ def load_split(split: str, limit: int | None = None) -> list[Utterance]:
     from datasets import load_dataset
 
     raw = load_dataset(DATASET_ID, split=split)
+    votes = load_stress_votes(split)
+    if len(votes) != len(raw):
+        raise ValueError(
+            f"split {split!r} has {len(raw)} rows but the official index lists "
+            f"{len(votes)} utterances"
+        )
     n = len(raw) if limit is None else min(limit, len(raw))
-    return [to_utterance(raw[i], i) for i in range(n)]
+    return [to_utterance(raw[i], i, votes[i]) for i in range(n)]
 
 
 def speaker_split(
@@ -231,7 +305,12 @@ class TargetStats:
 
 
 def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
-    """Field statistics over a split. `word.stress` is stated on its binary {0,1} scale."""
+    """Field statistics over a split, each field on its own reported scale.
+
+    `word.stress` is stated as the released 5/10 median, not as the vote count the head is
+    trained on: these statistics normalise the *reported* target, which is what the
+    correlation term and every metric speak.
+    """
     pools: dict[str, list[float]] = {}
 
     def add(level: str, field: str, value: float) -> None:
@@ -242,7 +321,7 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
             add("utterance", field, value)
         for w in u.words:
             add("word", "accuracy", w.accuracy)
-            add("word", "stress", stress_binary(w.stress))
+            add("word", "stress", w.stress)
             add("word", "total", w.total)
             for a in w.phone_accuracy:
                 add("phone", "accuracy", a)
@@ -251,7 +330,7 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
     for key, values in pools.items():
         level, field = key.split(".", 1)
         arr = np.asarray(values, dtype=np.float64)
-        low, high = TRAINING_RANGE[(level, field)]
+        low, high = FIELD_RANGE[(level, field)]
         floor = MIN_STD_FRACTION * (high - low)
         mean[key] = float(arr.mean())
         std[key] = float(max(arr.std(), floor))

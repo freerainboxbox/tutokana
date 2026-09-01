@@ -5,8 +5,10 @@ initialised biased low for phone and high for utterance, then
 `RMSNorm -> Linear(512) -> GELU -> Dropout -> Linear(n_out)` in fp32. A register is read at
 its own position; the -1 shift belongs to language-model cross-entropy only.
 
-Three output modes: `regression` (scalar), `soft_class` (logits over the label's discrete
-support, read out as an expectation) and `binary` (one logit).
+Four output modes: `regression` (scalar), `soft_class` (logits over the label's discrete
+support, read out as an expectation), `binary` (one logit) and `binomial` (one logit read as
+the probability that a single annotator flags the item, with the panel's verdict recovered
+through a beta-binomial).
 
 Phone conditioning supplies a per-phone difficulty prior: `film` scales and shifts the output
 from a 2-parameter embedding, `concat` appends a 32-dimensional symbol embedding to the input.
@@ -15,6 +17,8 @@ share no statistics.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -66,14 +70,20 @@ class ScoreHead(nn.Module):
       * `soft_class`  — logits over the field's discrete support, supervised with
                         cross-entropy against a smoothed one-hot and read out as the
                         expectation, so the prediction stays continuous.
-      * `binary`      — one logit, supervised with weighted BCE (word stress only).
+      * `binary`      — one logit, supervised with weighted BCE.
+      * `binomial`    — one logit read as p, the probability that a single annotator scores
+                        this item at the top of its scale. The panel's `n_raters` verdicts
+                        are modelled as Beta-Binomial(n, nu*p, nu*(1-p)), so the loss is the
+                        likelihood of the observed vote count and the readout is the
+                        probability that the panel's *median* lands at the top — which is
+                        the label the corpus actually publishes. Word stress only.
 
     `n_conditions > 0` enables per-symbol conditioning, with index 0 reserved as the shared
     fallback for unseen symbols. `conditioning="film"` applies a learned scale and shift to
     the head's output; `"concat"` appends a learned embedding to the input instead.
 
     Every head exposes both `predict_native` (the field's own scale, what metrics report)
-    and `predict_normalized` (z-scored, what the correlation term consumes), so the three
+    and `predict_normalized` (z-scored, what the correlation term consumes), so the four
     modes stay interchangeable behind one interface and callers never have to remember which
     scale a particular head happens to speak.
     """
@@ -83,6 +93,8 @@ class ScoreHead(nn.Module):
         hidden_size: int,
         mode: str = "regression",
         support: tuple[float, ...] | None = None,
+        n_raters: int = 0,
+        concentration: float = 0.0,
         n_conditions: int = 0,
         conditioning: str = "film",
         condition_dim: int = 32,
@@ -92,7 +104,7 @@ class ScoreHead(nn.Module):
         std: float = 1.0,
     ):
         super().__init__()
-        if mode not in ("regression", "soft_class", "binary"):
+        if mode not in ("regression", "soft_class", "binary", "binomial"):
             raise ValueError(f"unknown head mode {mode!r}")
         if conditioning not in PHONE_CONDITIONING:
             raise ValueError(
@@ -100,12 +112,27 @@ class ScoreHead(nn.Module):
             )
         if mode == "soft_class" and not support:
             raise ValueError("soft_class heads require a discrete support")
+        if mode == "binomial":
+            if not support or len(support) != 2:
+                raise ValueError(
+                    "binomial heads report onto a two-valued median scale, so they need a "
+                    "support of exactly (low, high)"
+                )
+            if n_raters < 2 or concentration <= 0.0:
+                raise ValueError(
+                    f"binomial heads need n_raters >= 2 and concentration > 0, got "
+                    f"{n_raters} and {concentration}"
+                )
         self.mode = mode
+        self.n_raters = n_raters
         self.n_outputs = len(support) if mode == "soft_class" else 1
         self.register_buffer(
             "support",
             torch.tensor(support if support else (), dtype=torch.float32),
             persistent=False,
+        )
+        self.register_buffer(
+            "concentration", torch.tensor(float(concentration)), persistent=False
         )
         self.register_buffer("mean", torch.tensor(float(mean)), persistent=False)
         self.register_buffer("std", torch.tensor(float(std)), persistent=False)
@@ -143,12 +170,70 @@ class ScoreHead(nn.Module):
             out = out * (1.0 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
         return out
 
+    def vote_log_pmf(self, logits: torch.Tensor) -> torch.Tensor:
+        """(..., n_raters + 1) log-probabilities over the panel's vote count.
+
+        The head predicts p, the chance one annotator scores this item at the top. If the
+        annotators were exchangeable and independent given p the count would be Binomial,
+        but they are not: the model's p is an estimate, and the residual item-to-item
+        spread it cannot resolve shows up as overdispersion. Beta-Binomial absorbs that
+        with a single fixed concentration, and it is what makes the likelihood safe — a
+        Binomial assigns ~1e-10 to a unanimous dissent from a confident prediction, and
+        the resulting gradient spike is the whole reason a plain count loss misbehaves here.
+        """
+        # Both shape parameters come from a sigmoid of the logit rather than from p and
+        # 1 - p: the second form rounds to exactly zero once the logit passes ~16 in fp32,
+        # and lgamma(0) is infinite. Written this way the pair stays positive out to |z| ~ 67
+        # and, more importantly, the gradient survives saturation — a confidently wrong head
+        # is exactly where the loss still has to pull. Only that far tail is clamped.
+        z = logits.squeeze(-1).unsqueeze(-1)
+        alpha = (self.concentration * torch.sigmoid(z)).clamp_min(1e-30)
+        beta = (self.concentration * torch.sigmoid(-z)).clamp_min(1e-30)
+        n = float(self.n_raters)
+        k = torch.arange(self.n_raters + 1, device=logits.device, dtype=alpha.dtype)
+        log_choose = (
+            math.lgamma(n + 1.0) - torch.lgamma(k + 1.0) - torch.lgamma(n - k + 1.0)
+        )
+        return (
+            log_choose
+            + torch.lgamma(k + alpha)
+            + torch.lgamma(n - k + beta)
+            - torch.lgamma(n + alpha + beta)
+            + torch.lgamma(alpha + beta)
+            - torch.lgamma(alpha)
+            - torch.lgamma(beta)
+        )
+
+    def vote_log_likelihood(self, logits: torch.Tensor, votes: torch.Tensor) -> torch.Tensor:
+        """Log-probability of the observed vote count — the binomial head's pointwise loss."""
+        index = votes.long().clamp(0, self.n_raters).unsqueeze(-1)
+        return self.vote_log_pmf(logits).gather(-1, index).squeeze(-1)
+
+    def flagged_logit(self, logits: torch.Tensor) -> torch.Tensor:
+        """Log-odds that at least one annotator flagged this item (vote count below n).
+
+        Free from the same distribution the loss already uses, and a far better posed
+        question than the published label asks: 16% of words draw at least one dissent
+        against the 1% the median calls wrong.
+        """
+        log_pmf = self.vote_log_pmf(logits)
+        return log_pmf[..., :-1].logsumexp(dim=-1) - log_pmf[..., -1]
+
     def predict_native(self, logits: torch.Tensor) -> torch.Tensor:
         """Head output on the field's own scale (0-10, 0.0-2.0, or P(correct stress))."""
         if self.mode == "regression":
             return logits.squeeze(-1) * self.std + self.mean
         if self.mode == "binary":
             return torch.sigmoid(logits.squeeze(-1))
+        if self.mode == "binomial":
+            # The published label is the panel's median, so the quantity to report is the
+            # probability that the median lands at the top — P(votes > n/2) — mapped onto
+            # the field's reported endpoints. Pearson is affine-invariant, so this is the
+            # comparable number and not a rescaling choice.
+            majority = self.n_raters // 2 + 1
+            probability = self.vote_log_pmf(logits)[..., majority:].logsumexp(dim=-1).exp()
+            low, high = self.support[0], self.support[-1]
+            return low + (high - low) * probability
         return (torch.softmax(logits, dim=-1) * self.support).sum(dim=-1)
 
     def predict_normalized(self, logits: torch.Tensor) -> torch.Tensor:
@@ -201,6 +286,8 @@ class HeadBank(nn.Module):
                     hidden_size=hidden_size,
                     mode=spec["mode"],
                     support=spec.get("support"),
+                    n_raters=spec.get("n_raters", 0),
+                    concentration=spec.get("concentration", 0.0),
                     n_conditions=spec.get("n_conditions", 0),
                     conditioning=spec.get("conditioning", "none"),
                     proj_size=proj_size,
@@ -241,20 +328,30 @@ def build_head_specs(
     n_phone_conditions: int,
     phone_conditioning: str,
     stats,
+    stress_concentration: float | None = None,
 ) -> dict[str, dict]:
     """Assemble the per-(level, field) head configuration.
 
-    `head_modes` is keyed by level; word stress always overrides to `binary` because a 99:1
-    label split is a detection problem, not a regression one, and a regressor on it converges
-    to a constant, which leaves the correlation undefined.
+    `head_modes` is keyed by level; word stress always overrides to `binomial`. Its released
+    label is the median of five annotators, so on its own it is 99:1 binary and a regressor
+    on it converges to a constant. Modelling the five verdicts instead restores a six-valued
+    target without changing what is reported.
     """
     if phone_conditioning not in PHONE_CONDITIONING:
         raise ValueError(
             f"unknown phone_conditioning {phone_conditioning!r}; "
             f"known: {sorted(PHONE_CONDITIONING)}"
         )
-    from .data import FIELD_SUPPORT, TargetStats
+    from .data import (
+        FIELD_SUPPORT,
+        STRESS_CONCENTRATION,
+        STRESS_RATERS,
+        TargetStats,
+    )
     from .tokens import REGISTERS_BY_LEVEL, UNTRAINED_FIELDS
+
+    if stress_concentration is None:
+        stress_concentration = STRESS_CONCENTRATION
 
     specs: dict[str, dict] = {}
     for level in levels:
@@ -262,10 +359,14 @@ def build_head_specs(
             if (level, reg.field) in UNTRAINED_FIELDS:
                 continue
             key = TargetStats.key(level, reg.field)
-            mode = "binary" if (level, reg.field) == ("word", "stress") else head_modes[level]
+            stress = (level, reg.field) == ("word", "stress")
+            mode = "binomial" if stress else head_modes[level]
             spec: dict = {"mode": mode, "mean": stats.mean[key], "std": stats.std[key]}
-            if mode == "soft_class":
+            if mode in ("soft_class", "binomial"):
                 spec["support"] = FIELD_SUPPORT[(level, reg.field)]
+            if mode == "binomial":
+                spec["n_raters"] = STRESS_RATERS
+                spec["concentration"] = stress_concentration
             if level == "phone" and phone_conditioning != "none":
                 spec["n_conditions"] = n_phone_conditions
                 spec["conditioning"] = phone_conditioning

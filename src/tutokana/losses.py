@@ -139,9 +139,9 @@ class LossConfig:
     rare label costs more, and the rarest labels are also the noisiest. `--reweight-levels
     phone,word` restores the previous behaviour as an ablation.
 
-    `word.stress` is reweighted regardless of this setting: it is a `binary` head at a 99:1
-    split, and there is no sane configuration in which an unbalanced stress head is the
-    intended experiment.
+    `word.stress` is reweighted regardless of this setting: even over the five annotators'
+    vote count, 80% of words are a clean sweep, and there is no sane configuration in which
+    an unbalanced stress head is the intended experiment.
     """
 
     level_weights: dict[str, float] = field(
@@ -161,7 +161,8 @@ class LossConfig:
     #: Detection is ~99% of the achievable Spearman, and the multi-class cross-entropy alone
     #: spends most of its mass separating 1.8 from 2.0 instead.
     lambda_detect: float = 0.5
-    #: Positive-class weight in that term; 4.3 balances phone accuracy's 19% base rate.
+    #: Positive-class weight in that term; 4.3 balances phone accuracy's 19% base rate, and
+    #: happens to suit word stress too — 20.0% of words draw at least one dissenting expert.
     detect_pos_weight: float = 4.3
 
 
@@ -224,8 +225,13 @@ def detection_logit(head, logits: torch.Tensor) -> torch.Tensor | None:
     throwing this away by collapsing the distribution to its expectation, which conflates
     "confidently 1.6" with "unsure between 1.0 and 2.0" though only the second is suspicious.
 
+    A `binomial` head carries the same thing over its vote distribution: "below the ceiling"
+    is "not a clean sweep of the panel".
+
     Returns None for heads with no distribution to read (`regression`, `binary`).
     """
+    if head.mode == "binomial":
+        return head.flagged_logit(logits)
     if head.mode != "soft_class" or head.support.numel() == 0:
         return None
     top = int(torch.argmax(head.support))
@@ -240,7 +246,9 @@ def detection_loss(head, logits: torch.Tensor, batch, config: LossConfig) -> tor
     logit = detection_logit(head, logits)
     if logit is None:
         return None
-    ceiling = float(head.support.max())
+    # `raw` is the vote count for a binomial head and the native score otherwise, so the
+    # ceiling is whatever a top rating looks like on the scale the loss is reading.
+    ceiling = float(head.n_raters) if head.mode == "binomial" else float(head.support.max())
     target = (batch.raw < ceiling).to(logit.dtype)
     weight = logit.new_tensor(config.detect_pos_weight)
     return F.binary_cross_entropy_with_logits(logit, target, pos_weight=weight)
@@ -256,10 +264,12 @@ def head_loss(
     """Pointwise loss for one head, plus its normalized prediction for the CCC term."""
     if head.mode == "regression":
         elementwise = log_cosh(logits.squeeze(-1), batch.target)
+    elif head.mode == "binomial":
+        # `raw` is the annotator vote count, not a score: the likelihood of the panel.
+        elementwise = -head.vote_log_likelihood(logits, batch.raw)
     elif head.mode == "binary":
         # Class balance comes from the mean-1 inverse-frequency weights below rather than
-        # `pos_weight`, which would upweight the 99% majority here: `stress_binary` marks
-        # CORRECT stress as the positive, so the rare event is the negative class.
+        # `pos_weight`, which would upweight whichever class happens to be the majority.
         elementwise = F.binary_cross_entropy_with_logits(
             logits.squeeze(-1), batch.raw, reduction="none"
         )
@@ -344,7 +354,7 @@ def composite_loss(
 
 def build_reweighter(utterances, config: LossConfig) -> LabelReweighter:
     """Label histograms over the training split, for the inverse-frequency weights."""
-    from .data import TargetStats, stress_binary
+    from .data import TargetStats
 
     histograms: dict[str, dict[float, int]] = {}
 
@@ -358,7 +368,7 @@ def build_reweighter(utterances, config: LossConfig) -> LabelReweighter:
             add("utterance", name, float(value))
         for w in u.words:
             add("word", "accuracy", float(w.accuracy))
-            add("word", "stress", stress_binary(w.stress))
+            add("word", "stress", float(w.stress_votes))
             add("word", "total", float(w.total))
             for score in w.phone_accuracy:
                 add("phone", "accuracy", float(score))

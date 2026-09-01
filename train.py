@@ -187,6 +187,7 @@ def main() -> None:
             n_phone_conditions=len(phones) + 1,
             phone_conditioning=config.phone_conditioning,
             stats=stats,
+            stress_concentration=config.stress_concentration,
         )
         log.info("[model] heads %s", sorted(head_specs))
 

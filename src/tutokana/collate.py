@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .data import SAMPLE_RATE, TargetStats, Utterance, stress_binary
+from .data import SAMPLE_RATE, TargetStats, Utterance
 from .prompting import TargetSpec, render_prompt, render_target
 from .tokens import UNTRAINED_FIELDS, register_tokens
 
@@ -34,14 +34,17 @@ def head_key(level: str, field: str) -> str:
 class HeadBatch:
     """Flattened supervision for one (level, field) head across the whole batch.
 
-    `positions` is (M, 2) of (batch index, sequence index); `target` is z-scored;
-    `raw` keeps the native scale for reporting; `phone_id` is the FiLM conditioning index
-    and is present only for phone-level heads.
+    `positions` is (M, 2) of (batch index, sequence index). `native` is the field's reported
+    label, which is what every metric compares against; `target` is that z-scored, which is
+    what the correlation term consumes. `raw` is whatever the head's pointwise loss reads,
+    and equals `native` for every head except `binomial`, where it is the annotator vote
+    count. `phone_id` is the FiLM conditioning index, present only for phone-level heads.
     """
 
     positions: torch.Tensor
     target: torch.Tensor
     raw: torch.Tensor
+    native: torch.Tensor
     phone_id: torch.Tensor | None = None
 
     def to(self, device) -> "HeadBatch":
@@ -49,6 +52,7 @@ class HeadBatch:
             positions=self.positions.to(device),
             target=self.target.to(device),
             raw=self.raw.to(device),
+            native=self.native.to(device),
             phone_id=None if self.phone_id is None else self.phone_id.to(device),
         )
 
@@ -92,22 +96,26 @@ class Collator:
 
     # -- targets ---------------------------------------------------------------------
 
-    def _raw_value(self, utterance: Utterance, slot) -> float:
-        """Native-scale target, except word stress, which is carried as binary {0,1}.
-
-        Stress is 10 for 99.0% of words, so it is trained as weighted binary classification
-        rather than regression. Correlation is invariant to the affine map back onto the
-        reported 5-10 scale, so the published comparison is unaffected;
-        `data.from_binary_stress` performs that map for the error columns.
-        """
+    def _native_value(self, utterance: Utterance, slot) -> float:
+        """The label on the field's reported scale — what the metrics compare against."""
         if slot.level == "utterance":
             return utterance.utterance_targets()[slot.field]
         word = utterance.words[slot.word]
         if slot.level == "word":
-            if slot.field == "stress":
-                return stress_binary(word.stress)
             return getattr(word, slot.field)
         return word.phone_accuracy[slot.phone]
+
+    def _raw_value(self, utterance: Utterance, slot) -> float:
+        """The label the head's pointwise loss reads.
+
+        Identical to the reported label everywhere except word stress, where the released
+        5/10 score is the median of five annotators and the head is trained on how many of
+        them agreed. Reporting is unaffected: the head maps its prediction back onto the
+        published median scale.
+        """
+        if (slot.level, slot.field) == ("word", "stress"):
+            return float(utterance.words[slot.word].stress_votes)
+        return self._native_value(utterance, slot)
 
     def _phone_id(self, utterance: Utterance, slot) -> int:
         return self.phone_to_id.get(utterance.words[slot.word].phones[slot.phone], 0)
@@ -207,10 +215,11 @@ class Collator:
 
                 key = head_key(slot.level, slot.field)
                 bucket = collected.setdefault(
-                    key, {"positions": [], "raw": [], "phone_id": []}
+                    key, {"positions": [], "raw": [], "native": [], "phone_id": []}
                 )
                 bucket["positions"].append((b, positions[i]))
                 bucket["raw"].append(self._raw_value(utterance, slot))
+                bucket["native"].append(self._native_value(utterance, slot))
                 if slot.level == "phone":
                     bucket["phone_id"].append(self._phone_id(utterance, slot))
 
@@ -226,11 +235,13 @@ class Collator:
         for key, bucket in collected.items():
             level, field = key.split(".", 1)
             raw = torch.tensor(bucket["raw"], dtype=torch.float32)
-            normalized = (raw - self.stats.mean[key]) / self.stats.std[key]
+            native = torch.tensor(bucket["native"], dtype=torch.float32)
+            normalized = (native - self.stats.mean[key]) / self.stats.std[key]
             batches[key] = HeadBatch(
                 positions=torch.tensor(bucket["positions"], dtype=torch.long),
                 target=normalized,
                 raw=raw,
+                native=native,
                 phone_id=(
                     torch.tensor(bucket["phone_id"], dtype=torch.long)
                     if level == "phone"

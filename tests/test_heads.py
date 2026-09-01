@@ -1,4 +1,4 @@
-"""Heads: layer mixing, the three output modes, and FiLM conditioning."""
+"""Heads: layer mixing, the four output modes, and FiLM conditioning."""
 
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ def test_build_head_specs_rejects_unknown_conditioning(utterances):
         )
 
 
-def test_build_head_specs_forces_binary_stress(utterances):
+def test_build_head_specs_forces_binomial_stress(utterances):
     from tutokana.data import compute_target_stats
 
     specs = build_head_specs(
@@ -124,7 +124,9 @@ def test_build_head_specs_forces_binary_stress(utterances):
         phone_conditioning="film",
         stats=compute_target_stats(utterances),
     )
-    assert specs["word.stress"]["mode"] == "binary"
+    assert specs["word.stress"]["mode"] == "binomial"
+    assert specs["word.stress"]["n_raters"] == 5
+    assert specs["word.stress"]["support"] == (5.0, 10.0)
     assert specs["phone.accuracy"]["n_conditions"] == 7
     assert specs["phone.accuracy"]["conditioning"] == "film"
     assert "utterance.completeness" not in specs  # measured, never trained
@@ -149,7 +151,109 @@ def test_head_bank_reads_the_requested_positions(utterances):
             positions=torch.tensor([[0, 4], [1, 7]]),
             target=torch.zeros(2),
             raw=torch.zeros(2),
+            native=torch.zeros(2),
         )
     }
     out = bank.read(hidden, batch)
     assert out["utterance.accuracy"].shape == (2, 1)
+
+
+# --- the binomial (word stress) head --------------------------------------------------
+
+
+def _stress_head(concentration: float = 8.6) -> ScoreHead:
+    return ScoreHead(
+        hidden_size=8, mode="binomial", support=(5.0, 10.0),
+        n_raters=5, concentration=concentration,
+    )
+
+
+def test_binomial_head_needs_a_panel_and_a_concentration():
+    with pytest.raises(ValueError, match="two-valued median scale"):
+        ScoreHead(hidden_size=8, mode="binomial", n_raters=5, concentration=8.6)
+    with pytest.raises(ValueError, match="n_raters"):
+        ScoreHead(hidden_size=8, mode="binomial", support=(5.0, 10.0), concentration=8.6)
+
+
+def test_vote_distribution_is_a_distribution():
+    log_pmf = _stress_head().vote_log_pmf(torch.tensor([[-2.0], [0.0], [3.0]]))
+    assert log_pmf.shape == (3, 6)  # a panel of five has six possible verdicts
+    assert torch.allclose(log_pmf.logsumexp(dim=-1), torch.zeros(3), atol=1e-5)
+
+
+def test_vote_distribution_matches_the_closed_form():
+    """The lgamma expansion is easy to get subtly wrong, so pin it to the definition."""
+    head = _stress_head(concentration=4.0)
+    logits = torch.tensor([[-1.5], [0.5]])
+    p = torch.sigmoid(logits.squeeze(-1))
+    k = torch.arange(6.0)
+    alpha, beta = 4.0 * p.unsqueeze(-1), 4.0 * (1.0 - p).unsqueeze(-1)
+    expected = (
+        torch.lgamma(torch.tensor(6.0)) - torch.lgamma(k + 1) - torch.lgamma(6.0 - k)
+        + torch.lgamma(k + alpha) + torch.lgamma(5.0 - k + beta)
+        - torch.lgamma(5.0 + alpha + beta)
+        + torch.lgamma(alpha + beta) - torch.lgamma(alpha) - torch.lgamma(beta)
+    )
+    assert torch.allclose(head.vote_log_pmf(logits), expected, atol=1e-4)
+
+
+def test_stress_readout_is_the_probability_of_a_majority():
+    """The corpus publishes the panel's median, so that is what the head must report."""
+    head = _stress_head()
+    logits = torch.tensor([[-3.0], [0.0], [3.0]])
+    native = head.predict_native(logits)
+    assert ((native >= 5.0) & (native <= 10.0)).all()
+    assert (native.diff() > 0).all()                      # monotone in the logit
+    assert float(native[1]) == pytest.approx(7.5)         # p = 0.5 splits the panel evenly
+
+    majority = head.vote_log_pmf(logits)[:, 3:].logsumexp(dim=-1).exp()
+    assert torch.allclose(native, 5.0 + 5.0 * majority, atol=1e-5)
+
+
+def test_vote_likelihood_selects_the_observed_count():
+    head = _stress_head()
+    logits = torch.tensor([[1.0], [1.0]])
+    log_pmf = head.vote_log_pmf(logits)
+    likelihood = head.vote_log_likelihood(logits, torch.tensor([5.0, 2.0]))
+    assert torch.allclose(likelihood, torch.stack([log_pmf[0, 5], log_pmf[1, 2]]))
+
+
+def test_a_split_panel_is_cheaper_than_a_binomial_would_make_it():
+    """Why beta-binomial and not binomial.
+
+    A unanimous dissent against a confident head is a routine event here — 0.1% of words —
+    and a binomial calls it a one-in-a-billion surprise. The overdispersed likelihood keeps
+    that cost finite, which is what stops a single word from owning the step.
+    """
+    import math
+
+    head = _stress_head()
+    logits = torch.tensor([[6.0]])
+    beta_binomial = -float(head.vote_log_likelihood(logits, torch.tensor([0.0])))
+    binomial = -5.0 * math.log(1.0 - torch.sigmoid(torch.tensor(6.0)).item())
+    assert beta_binomial < binomial / 2
+
+
+def test_the_gradient_survives_a_confidently_wrong_head():
+    """A saturated logit is exactly where the loss still has to pull.
+
+    Bounding p by clamping it to [eps, 1-eps] looks harmless and silently zeroes the
+    gradient here, leaving the head stuck at whatever it was confidently wrong about.
+    """
+    for z in (-20.0, 0.0, 6.0, 20.0, 40.0):
+        logits = torch.tensor([[z]], requires_grad=True)
+        loss = -_stress_head().vote_log_likelihood(logits, torch.tensor([0.0])).sum()
+        loss.backward()
+        assert torch.isfinite(loss) and torch.isfinite(logits.grad).all()
+        if z > 0.0:
+            assert float(logits.grad) > 0.5
+
+
+def test_flagged_logit_reads_dissent_off_the_same_distribution():
+    head = _stress_head()
+    logits = torch.tensor([[-2.0], [2.0], [6.0]])
+    log_pmf = head.vote_log_pmf(logits)
+    expected = log_pmf[:, :-1].logsumexp(dim=-1) - log_pmf[:, -1]
+    assert torch.allclose(head.flagged_logit(logits), expected, atol=1e-4)
+    # More confident stress means less expected dissent.
+    assert (head.flagged_logit(logits).diff() < 0).all()

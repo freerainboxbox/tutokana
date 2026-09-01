@@ -8,20 +8,22 @@ import numpy as np
 import pytest
 
 from tutokana.data import (
+    STRESS_RATERS,
     TargetStats,
     compute_target_stats,
-    from_binary_stress,
     phone_vocabulary,
     speaker_split,
     stratified_indices,
-    stress_binary,
+    stress_median,
 )
 from tutokana.mix import build_mix, compute_multiplicities, phone_class_counts
 
 
-def test_stress_maps_to_binary_and_back():
-    assert stress_binary(10.0) == 1.0 and stress_binary(5.0) == 0.0
-    assert from_binary_stress(1.0) == 10.0 and from_binary_stress(0.0) == 5.0
+def test_stress_median_thresholds_the_panel():
+    """The released label is a majority vote, which is why it has only two values."""
+    assert [stress_median(k) for k in range(STRESS_RATERS + 1)] == [
+        5.0, 5.0, 5.0, 10.0, 10.0, 10.0
+    ]
 
 
 def test_validation_split_is_speaker_disjoint(utterances):
@@ -63,9 +65,11 @@ def test_degenerate_field_gets_a_floored_deviation(utterances):
     assert stats.std["utterance.completeness"] >= 1e-3
 
 
-def test_stress_statistics_are_on_the_binary_scale(utterances):
+def test_stress_statistics_are_on_the_published_median_scale(utterances):
+    """Normalisation follows the reported label, not the vote count the head trains on."""
     stats = compute_target_stats(utterances)
-    assert 0.0 <= stats.mean["word.stress"] <= 1.0
+    assert 5.0 <= stats.mean["word.stress"] <= 10.0
+    assert stats.support["word.stress"] == [5.0, 10.0]
 
 
 def test_phone_vocabulary_is_sorted_and_deduplicated(utterances):
@@ -125,13 +129,13 @@ def test_degenerate_field_is_floored_by_span_and_warns(utterances):
     """
     import warnings
 
-    from tutokana.data import MIN_STD_FRACTION, TRAINING_RANGE
+    from tutokana.data import FIELD_RANGE, MIN_STD_FRACTION
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         stats = compute_target_stats(utterances)
 
-    low, high = TRAINING_RANGE[("utterance", "completeness")]
+    low, high = FIELD_RANGE[("utterance", "completeness")]
     assert stats.std["utterance.completeness"] == pytest.approx(
         MIN_STD_FRACTION * (high - low)
     )
@@ -140,10 +144,10 @@ def test_degenerate_field_is_floored_by_span_and_warns(utterances):
 
 def test_worst_case_z_score_is_bounded(utterances):
     """The floor exists to bound this; the preflight refuses anything beyond it."""
-    from tutokana.data import TRAINING_RANGE
+    from tutokana.data import FIELD_RANGE
 
     stats = compute_target_stats(utterances)
-    for (level, field), (low, high) in TRAINING_RANGE.items():
+    for (level, field), (low, high) in FIELD_RANGE.items():
         key = TargetStats.key(level, field)
         if key not in stats.mean:
             continue

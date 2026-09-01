@@ -113,7 +113,7 @@ def test_stress_is_reweighted_even_when_its_level_is_not(utterances):
     config = LossConfig(reweight_levels=())
     reweighter = build_reweighter(utterances, config)
     assert "word.stress" in ALWAYS_REWEIGHTED
-    assert reweighter.weights_for("word.stress", torch.tensor([0.0, 1.0])) is not None
+    assert reweighter.weights_for("word.stress", torch.tensor([0.0, 5.0])) is not None
 
 
 #: The real word-accuracy histogram of the training split, whose tail is the whole problem:
@@ -172,7 +172,7 @@ def test_only_the_phone_head_is_reweighted_by_default(utterances):
     """Reweighting is a classification device; only the phone head is a classifier.
 
     On a regression head a label weight scales a log-cosh residual, which rebalances nothing.
-    `word.stress` is the exception — a binary head at 99:1 — and is always included.
+    `word.stress` is the exception — 80% of words are a clean sweep — and always included.
     """
     reweighter = build_reweighter(utterances, LossConfig())
     assert set(reweighter.tables) == {"phone.accuracy", "word.stress"}
@@ -254,6 +254,7 @@ def test_pos_weight_raises_the_cost_of_missing_a_mispronunciation():
     batch = HeadBatch(
         positions=torch.zeros(1, 2, dtype=torch.long), target=torch.zeros(1),
         raw=torch.tensor([2.0]),                                 # ...but it is at the ceiling
+        native=torch.tensor([2.0]),
     )
     plain = detection_loss(head, logits, batch, LossConfig(lambda_detect=1.0))
     weighted = detection_loss(
@@ -276,10 +277,78 @@ def test_detection_term_is_on_by_default_and_removable(utterances):
     logits = {"phone.accuracy": torch.randn(6, len(bank.head("phone.accuracy").support))}
     heads = {"phone.accuracy": HeadBatch(
         positions=torch.zeros(6, 2, dtype=torch.long), target=torch.randn(6),
-        raw=torch.tensor([2.0, 2.0, 1.6, 2.0, 0.4, 2.0]))}
+        raw=torch.tensor([2.0, 2.0, 1.6, 2.0, 0.4, 2.0]),
+        native=torch.tensor([2.0, 2.0, 1.6, 2.0, 0.4, 2.0]))}
 
     _, on = composite_loss(bank, logits, heads, LossConfig())
     _, off = composite_loss(bank, logits, heads, LossConfig(lambda_detect=0.0))
     assert "detect/phone.accuracy" in on
     assert "detect/phone.accuracy" not in off
     assert on["loss/total"] > off["loss/total"]
+
+
+# --- the binomial (word stress) head --------------------------------------------------
+
+
+def _stress_head():
+    from tutokana.heads import ScoreHead
+
+    return ScoreHead(
+        hidden_size=8, mode="binomial", support=(5.0, 10.0), n_raters=5, concentration=8.6
+    )
+
+
+def test_stress_head_recovers_the_annotator_agreement_rate():
+    """The point of the parameterisation: one logit, fitted to whole-panel counts.
+
+    Word stress publishes a majority vote, so on its own label it is 99:1 binary. Fitting
+    the vote count instead leaves a six-valued target, and the quantity being estimated is
+    the rate at which a single annotator calls the stress correct.
+    """
+    head = _stress_head()
+    torch.manual_seed(0)
+    # One shared logit against a panel that agrees 70% of the time: the estimand is the
+    # population rate, so a per-item parameter would just memorise each count.
+    votes = torch.distributions.Binomial(5, torch.full((4096,), 0.7)).sample()
+
+    logit = torch.zeros(1, requires_grad=True)
+    optimiser = torch.optim.Adam([logit], lr=0.05)
+    for _ in range(500):
+        optimiser.zero_grad()
+        (-head.vote_log_likelihood(logit.expand(4096).unsqueeze(-1), votes)).mean().backward()
+        optimiser.step()
+    assert float(torch.sigmoid(logit)) == pytest.approx(0.7, abs=0.02)
+
+
+def test_detection_reads_dissent_off_the_stress_head():
+    """Zero new parameters, and a far better posed question than the published label asks:
+    16% of words draw at least one dissent against the 1% the median calls wrong."""
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import detection_logit, detection_loss
+
+    head = _stress_head()
+    logits = torch.tensor([[4.0], [4.0]])
+    assert detection_logit(head, logits) is not None
+
+    # `raw` is the vote count, so "below the ceiling" is "not a clean sweep".
+    swept = HeadBatch(
+        positions=torch.zeros(2, 2, dtype=torch.long), target=torch.zeros(2),
+        raw=torch.tensor([5.0, 5.0]), native=torch.tensor([10.0, 10.0]),
+    )
+    split = HeadBatch(
+        positions=torch.zeros(2, 2, dtype=torch.long), target=torch.zeros(2),
+        raw=torch.tensor([3.0, 2.0]), native=torch.tensor([10.0, 5.0]),
+    )
+    config = LossConfig(lambda_detect=1.0)
+    assert detection_loss(head, logits, swept, config) < detection_loss(
+        head, logits, split, config
+    )
+
+
+def test_stress_reweighting_spans_the_vote_counts(utterances):
+    """The head trains on 0-5, so the inverse-frequency table has to as well."""
+    reweighter = build_reweighter(utterances, LossConfig(reweight_levels=()))
+    values, weights = reweighter.tables["word.stress"]
+    assert set(values) <= {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}
+    assert len(values) > 2                       # not the two-valued published label
+    assert float(weights.max() / weights.min()) <= LossConfig().reweight_max + 1e-6
