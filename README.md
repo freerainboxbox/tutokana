@@ -157,17 +157,20 @@ the conservative end — it errs toward a softer loss.
 ### The assistant turn
 
 ```
-<|turn>model<|channel>thought<channel|>
-<task>
-WE   <sep>W<phn> IY0<phn>          <sep><w_acc><w_str><w_tot>
-CALL <sep>K<phn> AO0<phn> L<phn>   <sep><w_acc><w_str><w_tot>
+<|turn>model
+<|channel>thought
+<channel|><task>
+WE<sep_p>W<phn> IY0<phn><sep_w><w_acc><w_str><w_tot>
+CALL<sep_p>K<phn> AO0<phn> L<phn><sep_w><w_acc><w_str><w_tot>
 <u_acc><u_pro><u_flu><u_tot><turn|>
 ```
 
-Each word's registers follow that word's phones; the utterance registers follow every word,
-with the total last. Under causal masking this reads bottom-up, so a word register attends to
-its own phones and the utterance registers attend to all of them — the phone → word →
-utterance hierarchy HMamba's ablation credits for its margin over a flat readout.
+Verbatim apart from the register names: the only whitespace is what is shown, and `<sep_p>`
+and `<sep_w>` are distinct tokens. Each word's registers follow that word's phones, behind
+`<sep_w>`; the utterance registers follow every word, with the total last. Under causal
+masking this reads bottom-up, so a word register attends to its own phones and the utterance
+registers attend to all of them — the phone → word → utterance hierarchy HMamba's ablation
+credits for its margin over a flat readout.
 
 ## Evaluation
 
