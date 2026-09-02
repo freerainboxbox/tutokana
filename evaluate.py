@@ -164,6 +164,7 @@ def main() -> None:
             phone_conditioning=config.phone_conditioning,
             stats=stats,
             stress_concentration=config.stress_concentration,
+            stress_siblings=config.stress_siblings,
         )
         # The untuned floor: the same wiring and the same target statistics, but random
         # heads over the stock model. Whatever it scores is what the architecture gets for

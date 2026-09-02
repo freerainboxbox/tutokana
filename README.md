@@ -134,9 +134,11 @@ the conservative end — it errs toward a softer loss.
 - The correlation term draws its moments from a 512-pair detached FIFO, not from the batch,
   so batch size can be chosen for memory.
 - **Detection term** (`--lambda-detect`, on by default): binary cross-entropy on "is this
-  label below the ceiling", read off a distribution the head already carries — for
-  `soft_class` as `log(1 − p_top) − log(p_top)`, for the stress head as the probability that
-  the panel was not unanimous. Zero new parameters. Worth +0.038 phone PCC.
+  label below the top of its scale" — see *What "detection" means*. It reads a distribution
+  the head already carries, so it adds no parameters: for `soft_class`,
+  `log(1 − p_top) − log(p_top)`; for the stress head, the log-odds that the panel was not
+  unanimous. Worth +0.038 phone PCC. For word stress the event it trains on is not the event
+  the table reports — see the caveat there.
 - Label-frequency reweighting on phone only, with the dynamic range capped at 10×. Uncapped
   inverse frequency spans 4176× here, which makes the loss a sawtooth. Word stress is
   reweighted regardless of the setting: 80.0% of its vote counts are a clean sweep.
@@ -181,6 +183,31 @@ Flattened Pearson per aspect per level over the whole split, matching the publis
 - **Spearman**, because Pearson is inflated by this corpus's skewed marginals.
 - **σ_pred / σ_gold**, which exposes variance collapse a correlation can hide.
 - **Detection** — see below.
+
+### What "detection" means
+
+One binary event, fixed, with nothing tunable on the label side: **is this label below the
+top of its scale?** Equivalently, "is this not a perfect score". The ceiling is just the
+field's maximum, and a label either sits on it or it does not.
+
+| field | ceiling | the event | base rate |
+|---|---|---|---|
+| phone.accuracy | 2.0 | this phone was not scored perfect | 18.7% |
+| word.accuracy | 10 | this word was not scored perfect | 10.3% |
+| word.total | 10 | this word was not scored perfect overall | 11.9% |
+| word.stress | 10 | the experts' median called the stress wrong | 0.8% |
+
+The `thresh` column in the eval table is a *different* thing and the easy one to conflate: it
+is where the model's continuous prediction is cut to turn it into a yes/no call, chosen after
+the fact to maximise F1. It moves only F1, precision and recall — AUC is threshold-free, and
+is the column to read.
+
+**Word stress trains on a different event than it reports.** The loss reads the vote count,
+so its ceiling is 5 of 5 and the event is "at least one of the five experts dissented", a
+20.0% base rate. The table reads the published median, so its ceiling is 10 and the event is
+"the median called it wrong", a 0.8% base rate. The auxiliary is therefore fitting a 20%
+question while the report scores a 0.8% one. Whether that costs anything is open; it is not
+currently separable, because `--lambda-detect` is global and phone accuracy wants the term.
 
 ### Spearman is a detection metric here
 
@@ -274,6 +301,7 @@ Each is a flag, not a rewrite. The defaults are the current best configuration.
 | is per-phone conditioning worth it? | `--phone-conditioning none` / `concat` |
 | does reweighting the regression heads help or hurt? | `--reweight-levels phone,word` |
 | is the overdispersed stress panel worth it, or would a binomial do? | `--stress-concentration 100` |
+| is word stress just a re-measurement of word quality? | `--stress-siblings` |
 | does opening the audio front end help? | `--train-audio-projection` |
 
 ## Layout

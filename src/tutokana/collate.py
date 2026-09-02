@@ -39,6 +39,12 @@ class HeadBatch:
     what the correlation term consumes. `raw` is whatever the head's pointwise loss reads,
     and equals `native` for every head except `binomial`, where it is the annotator vote
     count. `phone_id` is the FiLM conditioning index, present only for phone-level heads.
+
+    `word_index` names the word each row belongs to, batch-unique and present only for
+    word-level heads. It exists so a head can be handed a sibling head's output for the same
+    word: the three word registers are emitted together and therefore land in the same order
+    in every word-level batch, but that is an accident of `render_target`'s slot order and
+    nothing enforced it. Any consumer must check the indices match rather than assume it.
     """
 
     positions: torch.Tensor
@@ -46,6 +52,7 @@ class HeadBatch:
     raw: torch.Tensor
     native: torch.Tensor
     phone_id: torch.Tensor | None = None
+    word_index: torch.Tensor | None = None
 
     def to(self, device) -> "HeadBatch":
         return HeadBatch(
@@ -54,6 +61,7 @@ class HeadBatch:
             raw=self.raw.to(device),
             native=self.native.to(device),
             phone_id=None if self.phone_id is None else self.phone_id.to(device),
+            word_index=None if self.word_index is None else self.word_index.to(device),
         )
 
     def __len__(self) -> int:
@@ -189,6 +197,8 @@ class Collator:
         self, input_ids: torch.Tensor, utterances: list[Utterance], rendered
     ) -> dict[str, HeadBatch]:
         collected: dict[str, dict[str, list]] = {}
+        # Batch-unique id per (batch row, word), so word-level heads can be paired up.
+        word_ids: dict[tuple[int, int], int] = {}
 
         for b, (utterance, target) in enumerate(zip(utterances, rendered)):
             found: dict[str, list[int]] = {}
@@ -215,13 +225,18 @@ class Collator:
 
                 key = head_key(slot.level, slot.field)
                 bucket = collected.setdefault(
-                    key, {"positions": [], "raw": [], "native": [], "phone_id": []}
+                    key,
+                    {"positions": [], "raw": [], "native": [], "phone_id": [], "word_index": []},
                 )
                 bucket["positions"].append((b, positions[i]))
                 bucket["raw"].append(self._raw_value(utterance, slot))
                 bucket["native"].append(self._native_value(utterance, slot))
                 if slot.level == "phone":
                     bucket["phone_id"].append(self._phone_id(utterance, slot))
+                elif slot.level == "word":
+                    bucket["word_index"].append(
+                        word_ids.setdefault((b, slot.word), len(word_ids))
+                    )
 
             for name, positions in found.items():
                 used = cursor.get(name, 0)
@@ -242,6 +257,11 @@ class Collator:
                 target=normalized,
                 raw=raw,
                 native=native,
+                word_index=(
+                    torch.tensor(bucket["word_index"], dtype=torch.long)
+                    if level == "word"
+                    else None
+                ),
                 phone_id=(
                     torch.tensor(bucket["phone_id"], dtype=torch.long)
                     if level == "phone"

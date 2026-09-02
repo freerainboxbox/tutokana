@@ -188,6 +188,7 @@ def main() -> None:
             phone_conditioning=config.phone_conditioning,
             stats=stats,
             stress_concentration=config.stress_concentration,
+            stress_siblings=config.stress_siblings,
         )
         log.info("[model] heads %s", sorted(head_specs))
 

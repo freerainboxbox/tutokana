@@ -93,6 +93,7 @@ class Config:
     lambda_detect: float = 0.5
     detect_pos_weight: float = 4.3
     stress_concentration: float = 8.6
+    stress_siblings: bool = False
     reweight_levels: tuple[str, ...] = ("phone",)
     level_weight_phone: float = 1.0
     level_weight_word: float = 1.0

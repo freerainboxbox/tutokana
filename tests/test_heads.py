@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tutokana.collate import HeadBatch
 from tutokana.data import FIELD_SUPPORT, TargetStats
 from tutokana.heads import HeadBank, LayerMixture, ScoreHead, build_head_specs
 
@@ -257,3 +258,90 @@ def test_flagged_logit_reads_dissent_off_the_same_distribution():
     assert torch.allclose(head.flagged_logit(logits), expected, atol=1e-4)
     # More confident stress means less expected dissent.
     assert (head.flagged_logit(logits).diff() < 0).all()
+
+
+# --- sibling context (the --stress-siblings control) ----------------------------------
+
+
+def _word_batch(word_index, n=3):
+    return HeadBatch(
+        positions=torch.zeros(n, 2, dtype=torch.long),
+        target=torch.zeros(n), raw=torch.zeros(n), native=torch.zeros(n),
+        word_index=torch.tensor(word_index, dtype=torch.long),
+    )
+
+
+def _sibling_bank(utterances):
+    from tutokana.data import compute_target_stats
+
+    specs = build_head_specs(
+        levels=("word",),
+        head_modes={"word": "regression"},
+        n_phone_conditions=0,
+        phone_conditioning="none",
+        stats=compute_target_stats(utterances),
+        stress_siblings=True,
+    )
+    return HeadBank(hidden_size=16, specs=specs, levels=("word",), n_layers=1)
+
+
+def test_stress_siblings_is_off_by_default(utterances):
+    from tutokana.data import compute_target_stats
+
+    specs = build_head_specs(
+        levels=("word",), head_modes={"word": "regression"}, n_phone_conditions=0,
+        phone_conditioning="none", stats=compute_target_stats(utterances),
+    )
+    assert "context_from" not in specs["word.stress"]
+
+
+def test_stress_siblings_declares_its_sources(utterances):
+    from tutokana.data import compute_target_stats
+
+    specs = build_head_specs(
+        levels=("word",), head_modes={"word": "regression"}, n_phone_conditions=0,
+        phone_conditioning="none", stats=compute_target_stats(utterances),
+        stress_siblings=True,
+    )
+    assert specs["word.stress"]["context_from"] == ("word.accuracy", "word.total")
+    assert "context_from" not in specs["word.accuracy"]
+
+
+def test_sibling_context_widens_only_the_stress_head(utterances):
+    """Two extra scalars, so the control costs 2 x proj_size weights and nothing else."""
+    bank = _sibling_bank(utterances)
+    assert bank.head("word.stress").body[1].in_features == 16 + 2
+    assert bank.head("word.accuracy").body[1].in_features == 16
+    assert bank.head("word.total").body[1].in_features == 16
+
+
+def test_stress_head_reads_the_sibling_readouts(utterances):
+    bank = _sibling_bank(utterances)
+    hidden = (torch.randn(1, 12, 16),)
+    heads = {k: _word_batch([0, 1, 2]) for k in ("word.accuracy", "word.stress", "word.total")}
+    out = bank.read(hidden, heads)
+    assert set(out) == {"word.accuracy", "word.stress", "word.total"}
+    assert out["word.stress"].shape == (3, 1)
+
+
+def test_sibling_context_does_not_backpropagate_into_its_sources(utterances):
+    """One-way on purpose: the stress loss must not perturb the two heads that work."""
+    bank = _sibling_bank(utterances)
+    hidden = (torch.randn(1, 12, 16),)
+    heads = {k: _word_batch([0, 1, 2]) for k in ("word.accuracy", "word.stress", "word.total")}
+    bank.read(hidden, heads)["word.stress"].sum().backward()
+
+    assert bank.head("word.stress").body[1].weight.grad is not None
+    assert bank.head("word.accuracy").body[1].weight.grad is None
+    assert bank.head("word.total").body[1].weight.grad is None
+
+
+def test_mismatched_words_are_refused_rather_than_paired_by_row(utterances):
+    """The lockstep is asserted, not assumed — pairing by row would mislabel every score."""
+    bank = _sibling_bank(utterances)
+    hidden = (torch.randn(1, 12, 16),)
+    heads = {k: _word_batch([0, 1, 2]) for k in ("word.accuracy", "word.total")}
+    heads["word.stress"] = _word_batch([0, 1, 9])
+    with pytest.raises(RuntimeError, match="different words"):
+        bank.read(hidden, heads)
+

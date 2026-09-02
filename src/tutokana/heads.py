@@ -10,6 +10,9 @@ support, read out as an expectation), `binary` (one logit) and `binomial` (one l
 the probability that a single annotator flags the item, with the panel's verdict recovered
 through a beta-binomial).
 
+A head may also read a sibling head's readout for the same word (`--stress-siblings`),
+appended to its input as extra scalars and detached, so the coupling is one-way.
+
 Phone conditioning supplies a per-phone difficulty prior: `film` scales and shifts the output
 from a 2-parameter embedding, `concat` appends a 32-dimensional symbol embedding to the input.
 One head per symbol is deliberately not offered — rare phones would get too few examples and
@@ -28,6 +31,10 @@ import torch.nn as nn
 #: per-symbol embedding to its input. A head per symbol is deliberately absent — see the
 #: module docstring.
 PHONE_CONDITIONING = ("none", "film", "concat")
+
+#: What `--stress-siblings` feeds the stress head: the same word's other two readouts, in
+#: this order. Both are dense-target heads, which is the whole point — see build_head_specs.
+STRESS_SIBLING_SOURCES = ("word.accuracy", "word.total")
 
 
 class LayerMixture(nn.Module):
@@ -98,6 +105,7 @@ class ScoreHead(nn.Module):
         n_conditions: int = 0,
         conditioning: str = "film",
         condition_dim: int = 32,
+        context_dim: int = 0,
         proj_size: int = 512,
         dropout: float = 0.1,
         mean: float = 0.0,
@@ -125,6 +133,7 @@ class ScoreHead(nn.Module):
                 )
         self.mode = mode
         self.n_raters = n_raters
+        self.context_dim = context_dim
         self.n_outputs = len(support) if mode == "soft_class" else 1
         self.register_buffer(
             "support",
@@ -147,6 +156,9 @@ class ScoreHead(nn.Module):
             self.embedding = nn.Embedding(n_conditions, condition_dim)
             nn.init.zeros_(self.embedding.weight)
             hidden_size = hidden_size + condition_dim
+        # Sibling readouts are appended last, so the conditioning block above keeps its
+        # existing slice of the input and old checkpoints load unchanged at context_dim 0.
+        hidden_size = hidden_size + context_dim
 
         self.body = nn.Sequential(
             nn.RMSNorm(hidden_size),
@@ -156,14 +168,26 @@ class ScoreHead(nn.Module):
             nn.Linear(proj_size, self.n_outputs),
         )
 
-    def forward(self, states: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        states: torch.Tensor,
+        condition: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.conditioning != "none" and condition is None:
             raise ValueError(
                 f"this head is {self.conditioning}-conditioned but got no condition index"
             )
+        if bool(self.context_dim) != (context is not None):
+            raise ValueError(
+                f"this head expects context_dim={self.context_dim} but was given "
+                f"{'no context' if context is None else 'a context tensor'}"
+            )
         states = states.float()
         if self.embedding is not None:
             states = torch.cat([states, self.embedding(condition)], dim=-1)
+        if context is not None:
+            states = torch.cat([states, context.float()], dim=-1)
         out = self.body(states)
         if self.film is not None:
             gamma, beta = self.film(condition).unbind(dim=-1)
@@ -266,6 +290,12 @@ class HeadBank(nn.Module):
     ):
         super().__init__()
         self.levels = levels
+        #: {consumer key: source keys} — heads fed a sibling head's readout for the same word.
+        self.context_sources = {
+            key: tuple(spec["context_from"])
+            for key, spec in specs.items()
+            if spec.get("context_from")
+        }
         self.mixtures = nn.ModuleDict(
             {
                 level: LayerMixture(
@@ -290,6 +320,7 @@ class HeadBank(nn.Module):
                     concentration=spec.get("concentration", 0.0),
                     n_conditions=spec.get("n_conditions", 0),
                     conditioning=spec.get("conditioning", "none"),
+                    context_dim=len(spec.get("context_from", ())),
                     proj_size=proj_size,
                     dropout=dropout,
                     mean=spec.get("mean", 0.0),
@@ -302,12 +333,49 @@ class HeadBank(nn.Module):
     def head(self, key: str) -> ScoreHead:
         return self.heads[key.replace(".", "__")]
 
+    def sibling_context(
+        self, key: str, batch, heads: dict, outputs: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """(M, len(sources)) of sibling readouts for the same words, detached.
+
+        Normalized rather than native, so every source arrives on one z-scored scale
+        whatever mode it is. Detached on purpose: this head's loss is carried by ~1% of
+        words and is reweighted up to 10x, and letting that gradient into the accuracy and
+        total heads would risk the two columns that currently work to rescue the one that
+        does not. The pairing is asserted, never assumed — see `HeadBatch.word_index`.
+        """
+        columns = []
+        for source in self.context_sources[key]:
+            if source not in outputs:
+                raise RuntimeError(
+                    f"{key} reads {source}, which produced no output this batch; a context "
+                    f"source must be a trained head at the same level"
+                )
+            other = heads[source]
+            if batch.word_index is None or other.word_index is None:
+                raise RuntimeError(
+                    f"{key} reads {source} but one of them carries no word_index; sibling "
+                    f"context is only defined for word-level heads"
+                )
+            if not torch.equal(batch.word_index, other.word_index):
+                raise RuntimeError(
+                    f"{key} and {source} cover different words ({len(batch)} vs "
+                    f"{len(other)} rows); their register slots are no longer emitted in "
+                    f"lockstep, so pairing them by row would mislabel every score"
+                )
+            columns.append(self.head(source).predict_normalized(outputs[source]).detach())
+        return torch.stack(columns, dim=-1)
+
     def read(
         self, hidden_states: tuple[torch.Tensor, ...], heads: dict
     ) -> dict[str, torch.Tensor]:
-        """{head key: raw head output} for every populated head in the batch."""
+        """{head key: raw head output} for every populated head in the batch.
+
+        Two passes: heads that read a sibling's output run after the heads they read.
+        """
         pooled: dict[str, torch.Tensor] = {}
         outputs: dict[str, torch.Tensor] = {}
+        deferred: list[tuple[str, object, torch.Tensor]] = []
         for key, batch in heads.items():
             if len(batch) == 0:
                 continue
@@ -315,7 +383,13 @@ class HeadBank(nn.Module):
             if level not in pooled:
                 pooled[level] = self.mixtures[level](hidden_states)
             states = pooled[level][batch.positions[:, 0], batch.positions[:, 1]]
+            if key in self.context_sources:
+                deferred.append((key, batch, states))
+                continue
             outputs[key] = self.head(key)(states, batch.phone_id)
+        for key, batch, states in deferred:
+            context = self.sibling_context(key, batch, heads, outputs)
+            outputs[key] = self.head(key)(states, batch.phone_id, context)
         return outputs
 
     def mixture_report(self) -> dict[str, list[float]]:
@@ -329,6 +403,7 @@ def build_head_specs(
     phone_conditioning: str,
     stats,
     stress_concentration: float | None = None,
+    stress_siblings: bool = False,
 ) -> dict[str, dict]:
     """Assemble the per-(level, field) head configuration.
 
@@ -336,6 +411,11 @@ def build_head_specs(
     label is the median of five annotators, so on its own it is 99:1 binary and a regressor
     on it converges to a constant. Modelling the five verdicts instead restores a six-valued
     target without changing what is reported.
+
+    `stress_siblings` hands the stress head the word accuracy and word total readouts for the
+    same word, as two extra input scalars. It is the control for the sibling-coupling
+    question: those two heads already predict the stress label better than the stress head
+    does, so if two numbers recover most of that, no richer coupling is warranted.
     """
     if phone_conditioning not in PHONE_CONDITIONING:
         raise ValueError(
@@ -371,4 +451,18 @@ def build_head_specs(
                 spec["n_conditions"] = n_phone_conditions
                 spec["conditioning"] = phone_conditioning
             specs[f"{level}.{reg.field}"] = spec
+
+    if stress_siblings:
+        if "word.stress" not in specs:
+            raise ValueError(
+                "stress_siblings needs the word.stress head, which this level selection "
+                "does not build"
+            )
+        sources = tuple(k for k in STRESS_SIBLING_SOURCES if k in specs)
+        if not sources:
+            raise ValueError(
+                f"stress_siblings needs at least one of {list(STRESS_SIBLING_SOURCES)}, "
+                f"none of which is being built"
+            )
+        specs["word.stress"]["context_from"] = sources
     return specs

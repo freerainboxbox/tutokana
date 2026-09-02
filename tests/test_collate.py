@@ -209,3 +209,29 @@ def test_levels_restrict_which_heads_are_supervised(tokenizer, utterances):
     )
     batch = collator(utterances[:2])
     assert {k.split(".")[0] for k in batch["heads"]} == {"utterance"}
+
+
+def test_word_index_pairs_the_sibling_registers(collator, utterances):
+    """The three word heads must land in the same order, and it must be checkable.
+
+    Sibling coupling reads accuracy and total for the same word off matching rows. That
+    lockstep is a consequence of `render_target`'s slot order, not something it promises, so
+    `word_index` records the pairing instead of leaving it to be assumed.
+    """
+    batch = collator(utterances)
+    word_keys = [head_key("word", f) for f in ("accuracy", "stress", "total")]
+    indices = [batch["heads"][k].word_index for k in word_keys]
+
+    assert all(i is not None for i in indices)
+    for other in indices[1:]:
+        assert torch.equal(indices[0], other)
+    # Batch-unique and dense, so a row identifies exactly one word of one utterance.
+    n_words = sum(len(u.words) for u in utterances)
+    assert sorted(indices[0].tolist()) == list(range(n_words))
+
+
+def test_only_word_heads_carry_a_word_index(collator, utterances):
+    batch = collator(utterances)
+    assert batch["heads"][head_key("phone", "accuracy")].word_index is None
+    assert batch["heads"][head_key("utterance", "accuracy")].word_index is None
+
