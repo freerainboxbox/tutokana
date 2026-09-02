@@ -4,6 +4,9 @@
 raw split is dominated by correct speech. `compute_multiplicities` greedily repeats
 utterances to maximise phone-class entropy, and `sample_negatives` pairs transcripts with
 mismatched audio using disjoint word sets to manufacture unambiguous mispronunciations.
+
+A negative is unambiguous for accuracy, total and every phone, and says nothing about
+stress: its words carry no stress label and their stress registers are left unsupervised.
 """
 
 from __future__ import annotations
@@ -66,10 +69,14 @@ def make_negative(a: Utterance, b: Utterance, rng: random.Random) -> Utterance:
         Word(
             text=w.text,
             accuracy=(0.0 if severity == 0 else float(rng.choice([0, 1]))),
-            # The dataset's default where stress is unratable, stated as a clean sweep of
-            # the annotator panel so the stress head sees the same label shape as real words.
-            stress=10.0,
-            stress_votes=5,
+            # Unrated, not correct. The audio is a different sentence, so there is no stress
+            # pattern to judge; the register is still emitted, and the collator gives it no
+            # target. This used to be stated as a clean sweep of the panel, which put ~1800
+            # words per epoch at the wrecked end of the mix all labelled "stress perfect" —
+            # against real annotators, who call the stress wrong on a third of wrecked words
+            # — and taught the head that the most wrecked words have the best stress.
+            stress=None,
+            stress_votes=None,
             total=(0.0 if severity == 0 else float(rng.choice([0, 1]))),
             phones=w.phones,  # canonical phones are transcript-derived, so A's stand
             phone_accuracy=(0.0,) * len(w.phones),
@@ -147,6 +154,7 @@ def build_mix(
         "base_samples": len(utterances),
         "oversampled_samples": int(mult.sum()),
         "n_negatives": len(negatives),
+        "stress_unrated_words": sum(len(u.words) for u in negatives),
         "epoch_samples": len(mixed),
         "multiplicity_max": int(mult.max()),
         "phone_entropy_base": _entropy(base_totals) / float(np.log(3)),

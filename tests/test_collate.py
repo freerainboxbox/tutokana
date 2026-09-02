@@ -235,3 +235,33 @@ def test_only_word_heads_carry_a_word_index(collator, utterances):
     assert batch["heads"][head_key("phone", "accuracy")].word_index is None
     assert batch["heads"][head_key("utterance", "accuracy")].word_index is None
 
+
+
+def test_unrated_stress_registers_get_no_row(collator, utterances):
+    """A negative's stress register is emitted but unsupervised: no row, hence no gradient."""
+    import random
+
+    from tutokana.mix import make_negative
+
+    real, negative = utterances[0], make_negative(utterances[0], utterances[1], random.Random(0))
+    batch = collator([real, negative])
+    stress = batch["heads"][head_key("word", "stress")]
+    accuracy = batch["heads"][head_key("word", "accuracy")]
+
+    assert len(stress) == len(real.words)
+    assert len(accuracy) == len(real.words) + len(negative.words)
+    assert stress.positions[:, 0].tolist() == [0] * len(real.words)
+    assert stress.raw.tolist() == [float(w.stress_votes) for w in real.words]
+    # The stress rows are a strict subset of the accuracy rows, paired by word index.
+    assert set(stress.word_index.tolist()) < set(accuracy.word_index.tolist())
+
+
+def test_a_batch_of_only_negatives_has_no_stress_batch(collator, utterances):
+    import random
+
+    from tutokana.mix import make_negative
+
+    negative = make_negative(utterances[0], utterances[1], random.Random(0))
+    batch = collator([negative])
+    assert head_key("word", "stress") not in batch["heads"]
+    assert len(batch["heads"][head_key("word", "accuracy")]) == len(negative.words)

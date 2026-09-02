@@ -368,7 +368,8 @@ def build_reweighter(utterances, config: LossConfig) -> LabelReweighter:
             add("utterance", name, float(value))
         for w in u.words:
             add("word", "accuracy", float(w.accuracy))
-            add("word", "stress", float(w.stress_votes))
+            if w.stress_rated:
+                add("word", "stress", float(w.stress_votes))
             add("word", "total", float(w.total))
             for score in w.phone_accuracy:
                 add("phone", "accuracy", float(score))

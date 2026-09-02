@@ -336,12 +336,27 @@ def test_sibling_context_does_not_backpropagate_into_its_sources(utterances):
     assert bank.head("word.total").body[1].weight.grad is None
 
 
-def test_mismatched_words_are_refused_rather_than_paired_by_row(utterances):
-    """The lockstep is asserted, not assumed — pairing by row would mislabel every score."""
+def test_sibling_rows_pair_by_word_not_by_position(utterances):
+    """The stress batch may omit unrated words; its context must still be those words' own."""
+    bank = _sibling_bank(utterances)
+    hidden = (torch.randn(1, 12, 16),)
+    heads = {k: _word_batch([0, 1, 2]) for k in ("word.accuracy", "word.total")}
+    heads["word.stress"] = _word_batch([2, 0], n=2)
+    out = bank.read(hidden, heads)
+    assert out["word.stress"].shape == (2, 1)
+
+    context = bank.sibling_context("word.stress", heads["word.stress"], heads, out)
+    for column, source in enumerate(("word.accuracy", "word.total")):
+        expected = bank.head(source).predict_normalized(out[source])[[2, 0]]
+        assert torch.allclose(context[:, column], expected)
+
+
+def test_words_missing_from_a_source_are_refused_rather_than_paired_by_row(utterances):
+    """A reader rated on a word its source is not is an error, not a silent skip."""
     bank = _sibling_bank(utterances)
     hidden = (torch.randn(1, 12, 16),)
     heads = {k: _word_batch([0, 1, 2]) for k in ("word.accuracy", "word.total")}
     heads["word.stress"] = _word_batch([0, 1, 9])
-    with pytest.raises(RuntimeError, match="different words"):
+    with pytest.raises(RuntimeError, match="words that word.accuracy does not"):
         bank.read(hidden, heads)
 

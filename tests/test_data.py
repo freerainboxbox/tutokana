@@ -156,3 +156,36 @@ def test_worst_case_z_score_is_bounded(utterances):
             abs(stats.normalize(level, field, high)),
         )
         assert extreme < 60.0, (key, extreme)
+
+
+def test_negatives_carry_no_stress_label(utterances):
+    """A mismatched recording has no stress pattern to judge, so the register is unsupervised.
+
+    Stated as a clean sweep of the panel, the negatives put ~1800 wrecked words per epoch at
+    "stress perfect" and taught the head that the most wrecked words have the best stress.
+    """
+    mixed, stats = build_mix(utterances, k=1, n_negatives=4, seed=0)
+    negatives = [u for u in mixed if u.index < 0]
+    assert negatives and all(not w.stress_rated for n in negatives for w in n.words)
+    assert all(w.stress is None and w.stress_votes is None for n in negatives for w in n.words)
+    assert stats["stress_unrated_words"] == sum(len(n.words) for n in negatives)
+    assert all(w.stress_rated for u in utterances for w in u.words)
+
+
+def test_target_stats_and_label_census_skip_unrated_stress(utterances):
+    """Unrated words leave the stress statistics and the reweighting histogram untouched."""
+    import torch
+    from tutokana.data import TargetStats, compute_target_stats
+    from tutokana.losses import LossConfig, build_reweighter
+
+    mixed, _ = build_mix(utterances, k=1, n_negatives=4, seed=0)
+    base, with_negatives = compute_target_stats(utterances), compute_target_stats(mixed)
+    stress, total = TargetStats.key("word", "stress"), TargetStats.key("word", "total")
+    assert with_negatives.mean[stress] == base.mean[stress]
+    assert with_negatives.std[stress] == base.std[stress]
+    assert with_negatives.mean[total] < base.mean[total]  # the other fields do see them
+
+    a = build_reweighter(utterances, LossConfig())
+    b = build_reweighter(mixed, LossConfig())
+    assert a.tables[stress][0] == b.tables[stress][0]
+    assert torch.equal(a.tables[stress][1], b.tables[stress][1])

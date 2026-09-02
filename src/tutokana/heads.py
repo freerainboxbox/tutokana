@@ -342,7 +342,9 @@ class HeadBank(nn.Module):
         whatever mode it is. Detached on purpose: this head's loss is carried by ~1% of
         words and is reweighted up to 10x, and letting that gradient into the accuracy and
         total heads would risk the two columns that currently work to rescue the one that
-        does not. The pairing is asserted, never assumed — see `HeadBatch.word_index`.
+        does not. Rows are paired by `HeadBatch.word_index`, never by position: the reader
+        may cover a subset of its sources' words (a synthetic negative has no stress rating),
+        and a word the reader has that a source lacks is an error, not a silent skip.
         """
         columns = []
         for source in self.context_sources[key]:
@@ -357,13 +359,18 @@ class HeadBank(nn.Module):
                     f"{key} reads {source} but one of them carries no word_index; sibling "
                     f"context is only defined for word-level heads"
                 )
-            if not torch.equal(batch.word_index, other.word_index):
+            n_words = int(max(batch.word_index.max(), other.word_index.max())) + 1
+            row_of = torch.full((n_words,), -1, dtype=torch.long, device=other.word_index.device)
+            row_of[other.word_index] = torch.arange(len(other), device=other.word_index.device)
+            rows = row_of[batch.word_index]
+            if bool((rows < 0).any()):
                 raise RuntimeError(
-                    f"{key} and {source} cover different words ({len(batch)} vs "
-                    f"{len(other)} rows); their register slots are no longer emitted in "
-                    f"lockstep, so pairing them by row would mislabel every score"
+                    f"{key} covers {int((rows < 0).sum())} words that {source} does not; a "
+                    f"context source must be rated on every word its reader is rated on, "
+                    f"so pairing these by row would mislabel scores"
                 )
-            columns.append(self.head(source).predict_normalized(outputs[source]).detach())
+            readout = self.head(source).predict_normalized(outputs[source]).detach()
+            columns.append(readout[rows])
         return torch.stack(columns, dim=-1)
 
     def read(

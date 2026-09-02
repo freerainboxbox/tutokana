@@ -80,15 +80,23 @@ class Word:
     `stress` is the released label, which is the *median* of the five experts' {5, 10}
     verdicts and therefore takes only those two values. `stress_votes` is how many of the
     five judged the stress correct, 0-5, which is the label the head is trained on.
+
+    Both are None on a word whose stress was never rated. The corpus rates every word; the
+    synthetic negatives in `mix` do not, so their stress register is emitted but carries no
+    target. Readers of either field go through `stress_rated` first.
     """
 
     text: str
     accuracy: float
-    stress: float
-    stress_votes: int
+    stress: float | None
+    stress_votes: int | None
     total: float
     phones: tuple[str, ...]
     phone_accuracy: tuple[float, ...]
+
+    @property
+    def stress_rated(self) -> bool:
+        return self.stress_votes is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,7 +329,8 @@ def compute_target_stats(utterances: list[Utterance]) -> TargetStats:
             add("utterance", field, value)
         for w in u.words:
             add("word", "accuracy", w.accuracy)
-            add("word", "stress", w.stress)
+            if w.stress_rated:
+                add("word", "stress", w.stress)
             add("word", "total", w.total)
             for a in w.phone_accuracy:
                 add("phone", "accuracy", a)

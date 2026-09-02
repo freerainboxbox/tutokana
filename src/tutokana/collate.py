@@ -42,9 +42,9 @@ class HeadBatch:
 
     `word_index` names the word each row belongs to, batch-unique and present only for
     word-level heads. It exists so a head can be handed a sibling head's output for the same
-    word: the three word registers are emitted together and therefore land in the same order
-    in every word-level batch, but that is an accident of `render_target`'s slot order and
-    nothing enforced it. Any consumer must check the indices match rather than assume it.
+    word. The three word registers are emitted together, but a head may have no row for a
+    word that carries no label for it — a synthetic negative has an accuracy and a total but
+    no stress rating — so rows must be paired by this index, never by position.
     """
 
     positions: torch.Tensor
@@ -124,6 +124,17 @@ class Collator:
         if (slot.level, slot.field) == ("word", "stress"):
             return float(utterance.words[slot.word].stress_votes)
         return self._native_value(utterance, slot)
+
+    def _has_target(self, utterance: Utterance, slot) -> bool:
+        """False for a register that is emitted but unsupervised.
+
+        Only word stress can be unrated (the synthetic negatives). The register still appears
+        in the text so the assistant turn keeps one shape, but the head gets no row for it:
+        an unrated word must contribute no gradient, not a made-up label.
+        """
+        if (slot.level, slot.field) == ("word", "stress"):
+            return utterance.words[slot.word].stress_rated
+        return True
 
     def _phone_id(self, utterance: Utterance, slot) -> int:
         return self.phone_to_id.get(utterance.words[slot.word].phones[slot.phone], 0)
@@ -221,6 +232,8 @@ class Collator:
                 # slot and the count check at the end of the loop stays meaningful.
                 cursor[slot.name] = i + 1
                 if (slot.level, slot.field) in UNTRAINED_FIELDS:
+                    continue
+                if not self._has_target(utterance, slot):
                     continue
 
                 key = head_key(slot.level, slot.field)
