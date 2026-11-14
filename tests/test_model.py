@@ -25,7 +25,7 @@ from tutokana.heads import HeadBank, build_head_specs
 from tutokana.losses import CorrelationBuffer, LossConfig, build_reweighter, composite_loss
 from tutokana.model import LORA_TARGET_MODULES, ModelConfig, RegisterDelta, TutokanaModel
 from tutokana.prompting import TargetSpec
-from tutokana.tokens import register_tokens
+from tutokana.tokens import register_grid_tokens, register_tokens
 
 HIDDEN = 64
 CPU = torch.device("cpu")
@@ -233,3 +233,214 @@ def test_score_stops_early_and_returns_what_it_has(wired):
     assert result.partial is True
     assert 0 < result.scored < len(sample)
     assert result.metrics, "a partial pass must still produce metrics"
+
+
+# --- emitted delta: reaching the logits under tied weights -----------------------------
+
+
+def _emitted_model(tiny_base, processor):
+    """The same tiny base with the output-side delta switched on."""
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+    delta = RegisterDelta({**register_ids, **grid_ids}, HIDDEN)
+    model = TutokanaModel(
+        tiny_base,
+        HeadBank(HIDDEN, {}, ("phone",), n_layers=1),
+        delta,
+        ModelConfig(head_layers=1, emitted_delta=True),
+    )
+    return model, delta, grid_ids
+
+
+def test_emitted_delta_reaches_the_logits(tiny_base, processor):
+    """Tied weights mean an input-only delta leaves the output row stale.
+
+    The model emits score tokens under RAIL/RAFT, so `h . (W[i] + delta[i])` is the logit it
+    should get. Without the output hook the delta trains and never moves a logit.
+    """
+    model, delta, grid_ids = _emitted_model(tiny_base, processor)
+    emb = model.base.get_input_embeddings()
+    lm = model.base.get_output_embeddings()
+
+    target = grid_ids["2.0"]
+    with torch.no_grad():
+        delta.delta.zero_()
+        delta.delta[-1] = 0.0
+        # Put the delta on the row that owns `target`, then compare against the reference.
+        row = delta.token_ids.index(target)
+        delta.delta[row] = torch.ones(HIDDEN)
+        tok = torch.tensor([[2, target]])
+        hidden = emb(tok).detach()
+        logits = lm(emb(tok)).detach()
+
+        weight = emb.weight.detach().clone()
+        weight[target] = weight[target] + delta.delta[row].detach()
+        assert torch.allclose(logits, hidden @ weight.T, atol=1e-5)
+
+
+def test_emitted_delta_leaves_other_columns_alone(tiny_base, processor):
+    model, delta, grid_ids = _emitted_model(tiny_base, processor)
+    emb = model.base.get_input_embeddings()
+    lm = model.base.get_output_embeddings()
+    # Columns outside the delta set, so the hook must not touch them. Registers occupy the
+    # low ids, so picking 7 or 8 here would assert the opposite of what is true.
+    ours = set(delta.token_ids)
+    outside = [i for i in (0, 1, 2, 3, 4, 5, 40, 41) if i not in ours][:3]
+    assert outside, "no vocabulary id outside the delta set to test against"
+    with torch.no_grad():
+        delta.delta.normal_()
+        tok = torch.tensor([[2, grid_ids["1.0"], 40, 41]])
+        logits = lm(emb(tok)).detach()
+        plain = emb(tok).detach() @ emb.weight.detach().T
+        for column in outside:
+            assert torch.allclose(logits[..., column], plain[..., column], atol=1e-6)
+
+
+def test_emitted_delta_gives_gradient(tiny_base, processor):
+    """A delta that reaches the logits must also receive gradient through them."""
+    model, delta, grid_ids = _emitted_model(tiny_base, processor)
+    emb = model.base.get_input_embeddings()
+    lm = model.base.get_output_embeddings()
+    tok = torch.tensor([[2, grid_ids["0.2"]]])
+    lm(emb(tok)).sum().backward()
+    assert delta.delta.grad is not None
+    assert float(delta.delta.grad.abs().sum()) > 0.0
+
+
+def test_head_path_leaves_logits_untouched(tiny_base, processor):
+    """Default config keeps the regression-head path exactly as it was."""
+    register_ids = register_tokens(processor.tokenizer)
+    delta = RegisterDelta(register_ids, HIDDEN)
+    model = TutokanaModel(
+        tiny_base,
+        HeadBank(HIDDEN, {}, ("phone",), n_layers=1),
+        delta,
+        ModelConfig(head_layers=1),
+    )
+    assert model.config.emitted_delta is False
+    assert model._delta_output_handle is None
+    emb = model.base.get_input_embeddings()
+    lm = model.base.get_output_embeddings()
+    with torch.no_grad():
+        delta.delta.normal_()
+        tok = torch.tensor([[2, register_ids["word_stress"]]])
+        logits = lm(emb(tok))
+        assert torch.allclose(logits, emb(tok).detach() @ emb.weight.detach().T, atol=1e-6)
+
+
+def test_digit_seed_makes_the_row_read_as_a_number(processor):
+    """The delta is added to the slot's own base row, so the seed must cancel that row."""
+    from tutokana.model import digit_seed_rows
+
+    weight = torch.randn(262144, 16)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+    seeds = digit_seed_rows(processor.tokenizer, weight, grid_ids)
+
+    assert set(seeds) == set(grid_ids.values())
+    for text, token_id in grid_ids.items():
+        parts = processor.tokenizer.encode(text, add_special_tokens=False)
+        want = weight[torch.tensor(parts)].mean(dim=0)
+        assert torch.allclose(weight[token_id] + seeds[token_id], want, atol=1e-6)
+
+
+def test_digit_seed_excludes_registers(processor):
+    """A register has no textual meaning to inherit; zero is the right start."""
+    from tutokana.model import digit_seed_rows
+
+    weight = torch.randn(262144, 16)
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+    seeds = digit_seed_rows(processor.tokenizer, weight, grid_ids)
+    assert not (set(seeds) & set(register_ids.values()))
+
+
+def test_init_rows_follow_sorted_ids(processor):
+    """Rows are ordered by id, not by dict insertion: registers and grid interleave."""
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+    ordered = sorted(set(register_ids.values()) | set(grid_ids.values()))
+    init = torch.stack([torch.full((HIDDEN,), float(i)) for i in range(len(ordered))])
+    delta = RegisterDelta({**register_ids, **grid_ids}, HIDDEN, init=init)
+    assert delta.token_ids == ordered
+    for row, token_id in enumerate(ordered):
+        assert torch.allclose(delta.delta[row], init[row])
+
+
+# --- delta checkpoints are keyed by vocabulary id, not by row index ---------------------
+
+
+def test_delta_rows_are_id_keyed_across_token_sets(processor):
+    """A regression-head checkpoint (11 rows) must warm-start a variant (11 + 22 rows)."""
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+
+    source = RegisterDelta(register_ids, HIDDEN)
+    with torch.no_grad():
+        source.delta.normal_()
+    state = source.state_dict()
+    assert state["_token_ids"].tolist() == sorted(register_ids.values())
+
+    target = RegisterDelta({**register_ids, **grid_ids}, HIDDEN)
+    with torch.no_grad():  # the digit seed is what the grid rows must keep
+        target.delta.normal_()
+        seeded = target.delta.clone()
+
+    target.merge_state(state["delta"], state["_token_ids"])
+    for name, token_id in register_ids.items():
+        row = target.token_ids.index(token_id)
+        src = source.token_ids.index(token_id)
+        assert torch.allclose(target.delta[row], source.delta[src])
+    for token_id in grid_ids.values():
+        row = target.token_ids.index(token_id)
+        assert torch.allclose(target.delta[row], seeded[row]), "grid rows kept their seed"
+
+
+def test_legacy_delta_without_id_list_still_loads(processor):
+    """Files written before `token_ids` was persisted held exactly the 11 registers."""
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+
+    source = RegisterDelta(register_ids, HIDDEN)
+    with torch.no_grad():
+        source.delta.normal_()
+    legacy = {"delta": source.delta.detach().clone()}  # no token_ids key
+
+    target = RegisterDelta({**register_ids, **grid_ids}, HIDDEN)
+    target.merge_state(legacy["delta"], legacy.get("_token_ids"))
+    for token_id in register_ids.values():
+        row = target.token_ids.index(token_id)
+        src = source.token_ids.index(token_id)
+        assert torch.allclose(target.delta[row], source.delta[src])
+
+
+def test_legacy_delta_with_unknown_rows_is_rejected(processor):
+    """Guessing which 13 rows meant what would silently misplace trained weights."""
+    register_ids = register_tokens(processor.tokenizer)
+    delta = RegisterDelta({**register_ids, **register_grid_tokens(processor.tokenizer)}, HIDDEN)
+    with pytest.raises(RuntimeError, match="cannot be attributed"):
+        delta.merge_state(torch.randn(13, HIDDEN), None)
+
+
+def test_save_and_load_round_trip_preserves_ids(tiny_base, processor, tmp_path):
+    """The persisted id list is what makes the two token sets interoperable."""
+    register_ids = register_tokens(processor.tokenizer)
+    grid_ids = register_grid_tokens(processor.tokenizer)
+    delta = RegisterDelta({**register_ids, **grid_ids}, HIDDEN)
+    with torch.no_grad():
+        delta.delta.normal_()
+
+    from safetensors.torch import save_file, load_file
+
+    blob = {f"register_delta.{k}": v.detach().cpu().contiguous()
+            for k, v in delta.state_dict().items()}
+    save_file(blob, str(tmp_path / "heads.safetensors"))
+    reloaded = load_file(str(tmp_path / "heads.safetensors"))
+
+    assert reloaded["register_delta._token_ids"].tolist() == delta.token_ids
+    other = RegisterDelta(register_ids, HIDDEN)
+    other.merge_state(reloaded["register_delta.delta"], reloaded["register_delta._token_ids"])
+    for token_id in register_ids.values():
+        assert torch.allclose(
+            other.delta[other.token_ids.index(token_id)],
+            delta.delta[delta.token_ids.index(token_id)],
+        )

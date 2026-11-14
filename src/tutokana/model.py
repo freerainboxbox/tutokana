@@ -3,10 +3,22 @@
 The audio path is encoder-free — a raw 40 ms frame is projected straight into the embedding
 space — so LoRA on the language layers is also the acoustic adapter.
 
-Registers are force-fed at inference rather than sampled, so only their *input* embedding
-matters. `RegisterDelta` is a trainable (K, hidden) tensor added at register positions via a
-forward hook on the embedding module, zero-initialised. The hook is necessary because the
-multimodal path needs `input_ids` to scatter audio and cannot take `inputs_embeds`.
+`RegisterDelta` is a trainable (K, hidden) tensor over the tokens this project adds. It is
+applied through a forward hook rather than by passing `inputs_embeds`: the multimodal path
+needs `input_ids` to scatter audio, and handing it embeddings instead would bypass that.
+
+The delta has two attachment points, and the second one only matters once the model *emits*
+those tokens.
+
+- `attach()` patches the input embedding. This is all the regression-head path needs, because
+  there the model receives registers but never samples them.
+- `attach_output()` patches the logits. Under RAIL/RAFT the model emits registers as triggers
+  and score tokens as values, so the delta must reach the output side too. Gemma 4 ties
+  `lm_head.weight` to the embedding matrix, so a delta that only moved the activations would
+  make the input row and the output row of the same token disagree.
+
+The output side stays off unless `ModelConfig.emitted_delta` is set, so the regression-head
+path is unchanged.
 """
 
 from __future__ import annotations
@@ -49,22 +61,67 @@ def resolve_dtype(device: torch.device) -> torch.dtype:
 
 
 class RegisterDelta(nn.Module):
-    """A trainable additive delta on the input embedding of register tokens only.
+    """A trainable additive delta on the embedding of the tokens this project adds.
 
-    Applied through a forward hook on the base model's embedding module rather than by
-    passing `inputs_embeds`: the multimodal path needs `input_ids` to know where to scatter
-    the projected audio frames, and handing it embeddings instead would bypass that.
+    `token_ids` maps a name to a vocabulary id and may cover registers and grid tokens alike.
+    `init` seeds the rows, ordered as `sorted(token_ids.values())`; None means zeros, which is
+    right for registers and wrong for score tokens. See `digit_seed_rows`.
     """
 
-    def __init__(self, register_ids: dict[str, int], hidden_size: int):
+    def __init__(self, token_ids: dict[str, int], hidden_size: int, init=None):
         super().__init__()
-        self.token_ids = sorted(register_ids.values())
+        self.token_ids = sorted(token_ids.values())
         # `lookup` maps a vocabulary id to a row of `delta`, or -1 for every ordinary token.
         lookup = torch.full((max(self.token_ids) + 1,), -1, dtype=torch.long)
         for row, token_id in enumerate(self.token_ids):
             lookup[token_id] = row
         self.register_buffer("lookup", lookup, persistent=False)
+        # Persisted, so a checkpoint states which vocabulary ids its rows mean. Row order is
+        # otherwise an accident of which token set the saving model happened to register, and
+        # the regression-head path (11 rows) and a RAIL/RAFT path (11 + 22) share the file.
+        # Named `_token_ids` because `token_ids` is already a plain Python list on this
+        # module, and `register_buffer` refuses to shadow an existing attribute.
+        self.register_buffer(
+            "_token_ids", torch.tensor(self.token_ids, dtype=torch.long), persistent=True
+        )
         self.delta = nn.Parameter(torch.zeros(len(self.token_ids), hidden_size))
+        if init is not None:
+            with torch.no_grad():
+                self.delta.copy_(init.to(self.delta.dtype))
+
+    def merge_state(self, delta: torch.Tensor, token_ids: torch.Tensor | None) -> list[str]:
+        """Copy saved rows in by vocabulary id, keeping the init for rows the file lacks.
+
+        `load_state_dict` cannot do this: it raises on a size mismatch even with
+        `strict=False`, and the row count changes the moment the grid tokens join. Rows the
+        file does not cover keep their current value, which is what lets a variant warm-start
+        from a regression-head checkpoint and still keep its digit seed.
+
+        A file written before `token_ids` was persisted is assumed to hold exactly the
+        register set in sorted-id order, which is all any earlier build could register.
+        """
+        if token_ids is None:
+            from .tokens import ALL_REGISTERS
+
+            if delta.shape[0] != len(ALL_REGISTERS):
+                raise RuntimeError(
+                    f"checkpoint delta has {delta.shape[0]} rows and carries no token id list, "
+                    "so its rows cannot be attributed. Only the 11-register layout, which is "
+                    "all any earlier build could register, is inferable."
+                )
+            # An older file held exactly the registers, in sorted-id order.
+            token_ids = torch.tensor(
+                sorted(self.token_ids)[: len(ALL_REGISTERS)], dtype=torch.long
+            )
+        row_of = {int(tid): row for row, tid in enumerate(self.token_ids)}
+        copied = 0
+        with torch.no_grad():
+            for row, tid in enumerate(token_ids.tolist()):
+                target = row_of.get(int(tid))
+                if target is not None and row < delta.shape[0]:
+                    self.delta[target] = delta[row].to(self.delta.dtype)
+                    copied += 1
+        return [f"merged {copied}/{len(self.token_ids)} delta rows"]
 
     def forward(self, input_ids: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
         clamped = input_ids.clamp(max=self.lookup.numel() - 1)
@@ -83,6 +140,54 @@ class RegisterDelta(nn.Module):
 
         return embedding_module.register_forward_hook(hook)
 
+    def attach_output(self, lm_head: nn.Module):
+        """Add the delta's contribution to the logits of our tokens; returns the handle.
+
+        Tied weights mean `logits[..., i] = h . W[i]`. The effective row is `W[i] + delta[r]`,
+        so the logit needs `h . delta[r]` added. Only our K columns move, which is negligible
+        next to the (B, T, vocab) tensor the head already produced.
+
+        The write is in place on purpose: `index_add` would copy the whole logits tensor, and
+        that tensor is already the largest allocation in the pass.
+        """
+        ids = torch.tensor(self.token_ids, dtype=torch.long)
+
+        # `with_kwargs=True` gives the hook (module, args, kwargs, output).
+        def hook(_module, args, kwargs, output):
+            hidden = args[0] if args else kwargs.get("input")
+            if hidden is None or not torch.is_tensor(hidden):
+                return output
+            rows = ids.to(output.device)
+            extra = hidden.to(self.delta.dtype) @ self.delta.to(hidden.dtype).T
+            output[..., rows] = output[..., rows] + extra.to(output.dtype)
+            return output
+
+        return lm_head.register_forward_hook(hook, with_kwargs=True)
+
+
+def digit_seed_rows(tokenizer, embedding_weight, grid_ids: dict[str, int]) -> dict[int, torch.Tensor]:
+    """Seed each score token's delta from the embedding of the digits it stands for.
+
+    A score token occupies an unused vocabulary slot, so its base row carries no numeric
+    meaning. Zero-initialising the delta keeps it that way, and the model then learns from
+    scratch what `2.0` means in both directions. The base model already knows the digit
+    strings, so seed from them: the row for `1.0` becomes the mean of `1`, `.` and `0`.
+
+    The delta is *added* to the slot's own base row, so the seed subtracts that row. The
+    effective row is then the digit embedding, not digit plus leftover.
+
+    Registers are deliberately absent. They have no textual meaning to inherit, and zero is
+    the right start for a token the model must learn to read as a field name.
+    """
+    seeds: dict[int, torch.Tensor] = {}
+    for text, token_id in grid_ids.items():
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if not ids:
+            continue
+        rows = embedding_weight[torch.tensor(ids, device=embedding_weight.device)]
+        seeds[token_id] = rows.mean(dim=0) - embedding_weight[token_id]
+    return seeds
+
 
 @dataclass
 class ModelConfig:
@@ -97,6 +202,10 @@ class ModelConfig:
     head_dropout: float = 0.1
     layer_mixture: bool = True
     attn_implementation: str = "sdpa"
+    #: Apply the register delta to the logits as well as to the input embedding. Off keeps the
+    #: regression-head path exactly as it was. The RAIL/RAFT variants turn it on, because there
+    #: the model emits these tokens and tied weights demand both sides agree.
+    emitted_delta: bool = False
 
 
 class TutokanaModel(nn.Module):
@@ -120,6 +229,15 @@ class TutokanaModel(nn.Module):
         self.register_delta = register_delta
         self.config = config
         self._delta_handle = register_delta.attach(base.get_input_embeddings())
+        self._delta_output_handle = None
+        if config.emitted_delta:
+            lm_head = base.get_output_embeddings()
+            if lm_head is None:
+                raise RuntimeError(
+                    "emitted_delta needs an output embedding to hook, and this model exposes "
+                    "none; the RAIL/RAFT path cannot emit score tokens without one."
+                )
+            self._delta_output_handle = register_delta.attach_output(lm_head)
 
     def forward(
         self, batch: dict, *, with_lm_loss: bool = True
@@ -194,7 +312,11 @@ class TutokanaModel(nn.Module):
             if k.startswith("register_delta.")
         }
         self.heads.load_state_dict(head_state, strict=False)
-        self.register_delta.load_state_dict(delta_state, strict=False)
+        # Not load_state_dict: the row count changes when the grid tokens join, and a size
+        # mismatch raises even with strict=False. Rows merge by vocabulary id instead.
+        saved = delta_state.get("delta")
+        if saved is not None:
+            self.register_delta.merge_state(saved, delta_state.get("_token_ids"))
 
 
 def load_processor(model_id: str):
@@ -216,12 +338,17 @@ def build_model(
     device: torch.device,
     adapter_dir: Path | None = None,
     trainable_adapter: bool = False,
+    grid_ids: dict[str, int] | None = None,
+    tokenizer=None,
 ) -> TutokanaModel:
     """Load the base model, attach LoRA (or a saved adapter), heads and register delta.
 
     `trainable_adapter` matters when reloading: an adapter loaded for evaluation is frozen,
     but one loaded to continue training must not be, or the resumed run would silently
     optimise nothing but the heads.
+
+    `grid_ids` and `tokenizer` together enable the digit seed. Both are optional, so the
+    regression-head path, which registers no grid tokens, is untouched.
     """
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
@@ -284,7 +411,16 @@ def build_model(
         dropout=config.head_dropout,
         layer_mixture=config.layer_mixture,
     )
-    register_delta = RegisterDelta(register_ids, hidden_size)
+    all_ids = {**register_ids, **(grid_ids or {})}
+    delta_init = None
+    if grid_ids and tokenizer is not None:
+        # Rows must follow sorted(all_ids), not the order the two dicts happened to build in.
+        seeds = digit_seed_rows(tokenizer, base.get_input_embeddings().weight, grid_ids)
+        ordered = sorted(all_ids.values())
+        delta_init = torch.stack(
+            [seeds.get(i, torch.zeros(hidden_size)) for i in ordered]
+        )
+    register_delta = RegisterDelta(all_ids, hidden_size, init=delta_init)
 
     model = TutokanaModel(base, head_bank, register_delta, config)
     model.heads.to(device=device, dtype=torch.float32)

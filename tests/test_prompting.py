@@ -95,3 +95,32 @@ def test_parse_generated_ignores_the_utterance_register_line(utterance):
     assert all(word not in {r.token for r in UTTERANCE_REGISTERS} for word, _ in
                parse_generated(target.text))
     assert TASK.token not in target.text.split("\n", 1)[1]
+
+
+def test_parse_generated_survives_scored_turn():
+    """A RAIL/RAFT turn puts a score token after every register.
+
+    Stripping only the register list would leave `W<unused32>` in the phone slot, because
+    score tokens are not registers. Anchors are stripped uniformly instead.
+    """
+    scored = (
+        "<unused0>\n"
+        "WE<unused10>W<unused1><unused32> IY0<unused1><unused28>"
+        "<unused11><unused22><unused17><unused22>\n"
+        "CALL<unused10>K<unused1><unused30> AO0<unused1><unused26> L<unused1><unused34>"
+        "<unused11><unused22><unused15><unused22>\n"
+        "<unused20><unused20><unused21><unused20><turn|>"
+    )
+    assert parse_generated(scored) == [("WE", ["W", "IY0"]), ("CALL", ["K", "AO0", "L"])]
+
+
+def test_parse_generated_leaves_no_anchor_residue():
+    from tutokana.tokens import ANCHOR
+
+    scored = (
+        "<unused0>\nWE<unused10>W<unused1><unused32><unused11><unused22><unused17><unused22>"
+        "<turn|>"
+    )
+    for word, phones in parse_generated(scored):
+        assert not ANCHOR.search(word)
+        assert not any(ANCHOR.search(p) for p in phones)

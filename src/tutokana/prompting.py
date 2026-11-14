@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from .data import Utterance
 from .tokens import (
-    ALL_REGISTERS,
+    ANCHOR,
     LEVELS,
     PHONE_REGISTERS,
     SEP_PHONES,
@@ -154,10 +154,20 @@ def render_training_text(processor, utterance: Utterance, spec: TargetSpec) -> R
 def parse_generated(text: str) -> list[tuple[str, list[str]]]:
     """Recover [(word, [phones])] from a generated assistant turn.
 
-    Used only by the generative-mode evaluation, which measures phone error rate and word
+    Used by the generative-mode evaluation, which measures phone error rate and word
     exact-match. The scored evaluation never goes through here — it teacher-forces the
     canonical phones so every register aligns one-to-one with gold, which is the only way
     the phone correlation stays comparable to the published baselines.
+
+    Every token `tokens.py` adds is an **anchor**, and the anchors are what make the stream
+    parseable: they mark the task, separate phones from a word, separate a word from its
+    scores, and carry the scores themselves. So the parser treats them uniformly — drop any
+    `<unusedN>`, keep everything else — instead of stripping a hard-coded register list.
+    That matters now that score tokens exist too: a fixed register list would leave
+    `W<unused32>` in the phone slot, since score tokens are not registers.
+
+    Callers must decode with `skip_special_tokens=False`. With the default, the anchors that
+    separate the fields are gone and word/phone boundaries cannot be recovered.
     """
     body = text.split(TASK.token, 1)[-1]
     for cut in ("<turn|>", "<eos>"):
@@ -170,17 +180,15 @@ def parse_generated(text: str) -> list[tuple[str, list[str]]]:
             continue
         line = line.split(SEP_WORD.token, 1)[0]
         word, sep, phone_blob = line.partition(SEP_PHONES.token)
-        # The trailing utterance-register line carries no word; strip every register token
-        # so it falls out as empty rather than being read as a one-word transcript.
-        for reg in ALL_REGISTERS:
-            word = word.replace(reg.token, "")
-        word = word.strip()
+        # The trailing utterance-register line carries no word; strip the anchors so it falls
+        # out as empty rather than being read as a one-word transcript.
+        word = ANCHOR.sub("", word).strip()
         if not word:
             continue
         phones: list[str] = []
         if sep:
-            for reg in PHONE_REGISTERS:
-                phone_blob = phone_blob.replace(reg.token, " ")
-            phones = phone_blob.split()
+            # Anchors sit *after* each phone, so splitting on whitespace alone would glue a
+            # score onto its phone. Strip first, then split.
+            phones = ANCHOR.sub("", phone_blob).split()
         parsed.append((word, phones))
     return parsed

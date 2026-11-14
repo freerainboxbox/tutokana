@@ -4,6 +4,8 @@ This tool provides computer-aided pronunciation training using the [speechocean7
 
 The model does not generate scores as text. Instead, the assistant turn contains a phone transcript with **score-register tokens**. Small regression heads read the hidden state at these register positions. The model still produces a readable structured turn, but the numbers move out of the text channel.
 
+The RAIL/RAFT experiments break that rule on purpose: a register becomes a **trigger**, and the token after it carries the score. See **Score grids** below.
+
 ## Results
 
 The table shows Pearson correlation on the full 2500-utterance test split. The results use teacher-forcing.
@@ -26,7 +28,23 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 
 - Regression heads on register-token hidden states hold the scores, not generated text. Cross-entropy over digits does not track distance and is mode-seeking. This collapses prediction variance on saturated labels.
 - Eleven unused Gemma 4 vocabulary entries act as registers: one per phone, three per word, four per utterance, and separators. These are atomic special tokens. This keeps `len(tokenizer)` at 262144, so the embedding size does not change and IDs do not drift. The model skips `<unused8>` (id 14) because it triggers degenerate loops in llama.cpp.
-- The model receives registers at inference but never samples them. One forward pass reads all eight fields, so malformed output is impossible. Only the input embedding matters. The model trains a zero-initialized `(11, 3840)` `RegisterDelta` instead of the tied 262144×3840 embedding matrix.
+- On the regression-head path, the model receives registers at inference but never samples them. One forward pass reads all eight fields, so malformed output is impossible. Only the input embedding matters. The model trains a zero-initialized `(11, 3840)` `RegisterDelta` instead of the tied 262144×3840 embedding matrix. The RAIL/RAFT path drops this property: the model emits the registers as triggers, so malformed output becomes possible and the parser has to handle it.
+
+**Score grids (RAIL/RAFT)**
+
+- Under RAIL/RAFT the register becomes a trigger, and the score moves into the text channel. The model emits the score in one step. The grid distribution is the next-token distribution, limited to that type's tokens.
+- The code **derives the sets per score type**. Nothing is listed by hand. `SCORE_GRID` in `tokens.py` holds one `(spacing, low, high)` per scored type. `ScoreGrid` derives the values, the rendering and the token set from that. `GRID_STRINGS` is the union. Widen a grid, or add a type: one line changes, and the token set follows.
+- **Spacing decides the rendering, and the score type decides the spacing.** A step of 1 renders integers. A step of 0.2 renders one decimal place. So `1` and `1.0` are different tokens. `word.stress` votes share the integer set, and `phone.accuracy` uses the decimal set. All integer types share one set, and all decimal types share the other. A token therefore means the same number wherever the model emits it.
+- This rule is not cosmetic. The corpus writes `2` for a phone score of 2.0, and that value is 80.1% of phone labels. `ScoreGrid.render` reads the score type, so it still emits the decimal token `2.0`. A formatter that read the float would move phone scores onto the integer tokens. That breaks the grid silently.
+- `low` and `high` mark the ends of the **target space**, not the observed support. The training split omits word accuracy 4 and utterance accuracy 0 and 2, but those values exist. A regression-aware loss needs a grid that spans the space, so the expectation can land anywhere in it. Snapping is lossless on gold, because every released label sits on its own grid.
+- Grid tokens use `special=False`, the same policy as the registers. See the two bullets under **Output channel** for why the split policy was dropped.
+- Decoding uses `skip_special_tokens=False`. `parse_generated` walks the anchors instead of a hard-coded register list, so markers, triggers and score tokens all follow one rule. A default decode loses the field boundaries, so the parser cannot tell which field a score belongs to.
+- A score decodes to its slot name, `<unused20>`, not to `8`. The channel is atomic and stable, but not human-readable, so the parser maps id to value through the grid table. `strip_anchors` exists for display only.
+- `utterance.completeness` is deliberately gridless. It is untrained and has no register. Its released values (1.7, 6.7, 7.1, 7.5, 8.6, 8.9) sit on no step of 1 or 0.2. Training it would force a 0.1 grid and about 100 more tokens.
+- Slots come from the low `unused` block, ids 18 to 39, and use 22 of 77 free slots. `RegisterDelta` sizes its lookup table by the largest id it sees. Slots at 256001+ would grow that table from tens of entries to a quarter of a million. `<unused8>` (id 14) stays excluded.
+- Gemma 4 ties `lm_head.weight` to the embedding matrix, so a delta on the input activations alone never reaches the output side. `ModelConfig.emitted_delta` adds a second hook that puts `h . delta` into the logits of our columns. That is what makes the score tokens learnable in both directions. It is off by default, so the regression-head path is unchanged.
+- A score token occupies an unused slot whose base row carries no numeric meaning. So the delta seeds from the digits the token stands for, and the row for `1.0` becomes the mean of `1`, `.` and `0`. The seed subtracts the slot's own base row, because the delta is added to it. Registers keep a zero init. A field name has no textual meaning to inherit.
+- Delta rows are checkpointed **by vocabulary id**, alongside a persisted id list. `load_state_dict` raises on a size mismatch even with `strict=False`, and the row count goes from 11 to 33 the moment the grid tokens join. So `merge_state` copies rows by id instead. Rows the file does not cover keep their seed. That is what lets a variant warm-start from a regression-head checkpoint.
 
 **Ordering**
 
@@ -179,9 +197,11 @@ Press Ctrl-C to interrupt. The model finishes the current step, checkpoints, and
 
 Base weights download to the standard Hugging Face cache. Set `HF_HOME` to change this location. The `runs/` and `logs/` directories are gitignored and created automatically.
 
-## Ablations
+## Ablations & Variants
 
-Each ablation is a flag. The defaults use the current best configuration.
+**Ablations**
+
+Each ablation is a flag. The defaults use the current best configuration. Every one of these keeps the regression-head output channel, so they are all measured against the table in **Results**.
 
 | question                                                            | flag                                   |
 | ------------------------------------------------------------------- | -------------------------------------- |
@@ -196,11 +216,37 @@ Each ablation is a flag. The defaults use the current best configuration.
 | is word stress just a re-measurement of word quality?               | `--stress-siblings`                    |
 | does opening the audio front end help?                              | `--train-audio-projection`             |
 
+**Variants**
+
+A variant changes the output channel rather than a term inside it, so it is not a subtraction from the current model. It is a different model that shares the data path, the turn shape and the evaluation.
+
+**Neither flag is implemented yet.** The grid vocabulary and the emitted register delta exist, so the pieces are in place. No flag parses yet, and no run exists for either row. Read the claims below as the intent an implementation has to satisfy.
+
+| flag | training loss | inference | status |
+| --- | --- | --- | --- |
+| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | not implemented |
+| `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | not implemented |
+
+Both variants share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
+
+That reinjection is the point. Without it the model is a feature extractor with a regressor bolted on, which is the predictive-head design this project rejected. The two arms also separate the two halves of the RAFT paper's argument, and reading them needs both:
+
+- `--ce-rail` changes only the decision rule. RAIL fixes how a value is read out, but it cannot repair a distribution that cross-entropy already made mode-seeking. On word stress this arm is **predicted to lose**, and a loss here is a result rather than a bug.
+- `--raft-rail` changes the objective, so the trained distribution matches the one the readout assumes. This is where the paper's argument applies.
+
+Three consequences to carry into any implementation:
+
+- **Read the score from the grid distribution, not from the emitted token.** One sampled token keeps about half the achievable correlation, and 16 averaged samples keep about 87%. Report the expectation at the trigger position, and let the token be a rendering.
+- **`word.stress` scores on the vote-count grid and reports on the 5/10 median.** The released label is the median of five annotators, and 99% of it is one value. Training on it recreates the collapse the `binomial` head exists to avoid. Reporting still maps through `P(votes >= 3)`.
+- **Reinjection makes the coupling between fields bidirectional.** `--stress-siblings` detaches its gradient so a 1%-of-words loss cannot damage two working columns. A text stream has no such detach. That protection is gone in both variants, and the run notes should say so.
+
+Comparing a variant against the **Results** table is not apples to apples. The table is teacher-forced. A variant feeds its own emitted tokens back, so it should be reported with its own row and its own protocol note.
+
 ## Layout
 
 ```
 src/tutokana/
-  tokens.py       register table and registration
+  tokens.py       register table, score grids, registration
   data.py         dataset loading, targets, statistics
   mix.py          oversampling and synthetic negatives
   prompting.py    prompt and assistant-turn rendering
