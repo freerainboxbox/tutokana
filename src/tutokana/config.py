@@ -28,6 +28,28 @@ RUN_DIR = PACKAGE_ROOT / "runs"
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
+#: The output channel a run trains. `heads` reads every score out of a regression head at a
+#: register; the two RAIL/RAFT arms emit one grid token per score and read it off the
+#: next-token distribution instead. See the README section "Ablations & Variants".
+VARIANTS = ("heads", "ce_rail", "raft_rail")
+
+#: What each variant still needs before it can train. The guard exists because a parsed flag
+#: that nothing reads is worse than no flag: the run would train the head model, record
+#: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
+NOT_IMPLEMENTED = {
+    "ce_rail": (
+        "the LM-CE mask (collate._language_labels masks every register, so the score token "
+        "gets no cross-entropy)",
+        "the decode loop that snaps the expectation to a grid token and feeds it back",
+    ),
+    "raft_rail": (
+        "the RAFT loss in losses.py (squared error of the grid expectation)",
+        "the LM-CE mask (collate._language_labels masks every register, so the score token "
+        "gets no cross-entropy)",
+        "the decode loop that snaps the expectation to a grid token and feeds it back",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class DataConfig:
@@ -76,6 +98,11 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     head_modes: HeadModeConfig = field(default_factory=HeadModeConfig)
+    #: One field, not a boolean per arm: `--ce-rail` and `--raft-rail` are alternatives to
+    #: each other and to the default, so two booleans would accept a run that is both and
+    #: hand `Config.diff` a conflict with no meaning. `choices` is read by the argparse
+    #: binder, which derives `--ce-rail` and `--raft-rail` from the non-default values.
+    variant: str = field(default="heads", metadata={"choices": VARIANTS})
     model_id: str = "google/gemma-4-12B-it"
     device: str = "auto"
     lora_r: int = 32
@@ -105,6 +132,35 @@ class Config:
             "word": self.level_weight_word,
             "utterance": self.level_weight_utterance,
         }
+
+    def __post_init__(self) -> None:
+        # Not left to argparse alone: a resumed or hand-edited `config.json` reaches `Config`
+        # through `from_dict`, which trusts whatever it finds.
+        if self.variant not in VARIANTS:
+            raise SystemExit(
+                f"unknown variant {self.variant!r}; known variants: {', '.join(VARIANTS)}"
+            )
+
+    @property
+    def emits_scores(self) -> bool:
+        """Whether the scores travel as emitted text. False is the regression-head path.
+
+        Every unimplemented piece keys off this one value, so the arms cannot drift apart.
+        """
+        return self.variant != "heads"
+
+    def require_implemented(self) -> None:
+        """Stop before a run trains something its own flags do not describe."""
+        missing = NOT_IMPLEMENTED.get(self.variant)
+        if missing is None:
+            return
+        raise SystemExit(
+            f"variant {self.variant!r} is documented and parsed, but not implemented. "
+            f"Nothing was trained. Still missing:\n  - "
+            + "\n  - ".join(missing)
+            + f"\nRun the same command without --{self.variant.replace('_', '-')} to train "
+            "the regression-head model."
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -199,6 +255,32 @@ def _add_field(group, field_def, default, flag: str, dest: str) -> None:
         )
 
 
+def _add_choice_field(group, default, choices, flag: str, dest: str) -> None:
+    """A closed-value field: `--variant VALUE`, plus one flag per non-default value.
+
+    The per-value flags are the spelling the README documents (`--ce-rail`). They write the
+    same dest as `--variant`, so a run still carries one value to resume, diff and log, not a
+    pair of booleans that can both be true. Every spelling shares one mutually exclusive
+    group, so `--ce-rail --raft-rail` fails at the parser instead of resolving to whichever
+    flag came last.
+    """
+    arms = group.add_mutually_exclusive_group()
+    arms.add_argument(
+        flag, dest=dest, choices=list(choices), default=default,
+        help=f"(default: {default})",
+    )
+    for value in choices:
+        if value == default:
+            continue
+        arms.add_argument(
+            f"--{value.replace('_', '-')}", dest=dest, action="store_const", const=value,
+            # SUPPRESS, not the default. argparse fills a dest from the first action that
+            # claims it, so a real default here would overwrite `--variant`'s own.
+            default=argparse.SUPPRESS,
+            help=f"same as {flag} {value}",
+        )
+
+
 def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     """Expose every config field as a flag: --data-levels, --train-seed, --lora-r."""
     for prefix, kind in NESTED_GROUPS.items():
@@ -214,7 +296,11 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         if f.name in NESTED_GROUPS:
             continue
         flag = f"--{f.name.replace('_', '-')}"
-        _add_field(group, f, getattr(defaults, f.name), flag, f.name)
+        choices = f.metadata.get("choices")
+        if choices:
+            _add_choice_field(group, getattr(defaults, f.name), choices, flag, f.name)
+        else:
+            _add_field(group, f, getattr(defaults, f.name), flag, f.name)
 
 
 def config_from_args(args: argparse.Namespace) -> Config:

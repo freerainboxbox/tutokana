@@ -126,6 +126,10 @@ def main() -> None:
         run_dir = cfg.RUN_DIR / run_id
         conflicts = []
 
+    # Checked on the final config, so a resumed run's saved variant is honoured too: a run
+    # recorded as a variant this build cannot train must not be continued as something else.
+    config.require_implemented()
+
     with cfg.run_logging("train", run_id) as log:
         started = time.time()
         log.info("run %s", run_id)
@@ -201,6 +205,7 @@ def main() -> None:
                 train_audio_projection=config.train_audio_projection,
                 head_layers=config.head_layers,
                 layer_mixture=config.layer_mixture,
+                emitted_delta=config.emits_scores,
             ),
             head_specs=head_specs,
             levels=spec.levels,

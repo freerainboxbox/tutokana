@@ -220,14 +220,18 @@ Each ablation is a flag. The defaults use the current best configuration. Every 
 
 A variant changes the output channel rather than a term inside it, so it is not a subtraction from the current model. It is a different model that shares the data path, the turn shape and the evaluation.
 
-**Neither flag is implemented yet.** The grid vocabulary and the emitted register delta exist, so the pieces are in place. No flag parses yet, and no run exists for either row. Read the claims below as the intent an implementation has to satisfy.
+**Neither arm can run yet.** Both flags parse, are recorded in `config.json` and are diffed on resume, so a run states which channel it trained. What is not built is the training and inference path, so both arms stop before anything is loaded:
 
 | flag | training loss | inference | status |
 | --- | --- | --- | --- |
-| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | not implemented |
-| `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | not implemented |
+| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | parses, refuses |
+| `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | parses, refuses |
 
-Both variants share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
+`--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
+
+The refusal names what is still missing, which is the point of accepting the flag early: a parsed flag nothing reads would train the head model, write `variant: ce_rail` into its own record, and be indistinguishable from a real result.
+
+Both arms share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
 
 That reinjection is the point. Without it the model is a feature extractor with a regressor bolted on, which is the predictive-head design this project rejected. The two arms also separate the two halves of the RAFT paper's argument, and reading them needs both:
 

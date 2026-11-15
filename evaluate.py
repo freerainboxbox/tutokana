@@ -140,6 +140,8 @@ def main() -> None:
     meta = json.loads((run_dir / "config.json").read_text())
     config = cfg.Config.from_dict(meta["config"])
     run_id = meta.get("run_id", run_dir.name)
+    # A run directory records the variant it trained, so evaluating it cannot disagree with it.
+    config.require_implemented()
 
     with cfg.run_logging("eval", run_id) as log:
         log.info("run %s (trained %s)", run_dir, meta.get("completed_at", "?"))
@@ -176,6 +178,7 @@ def main() -> None:
                 head_layers=config.head_layers,
                 layer_mixture=config.layer_mixture,
                 gradient_checkpointing=False,
+                emitted_delta=config.emits_scores,
             ),
             head_specs=head_specs,
             levels=spec.levels,
