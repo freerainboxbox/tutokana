@@ -164,6 +164,10 @@ class LossConfig:
     #: Positive-class weight in that term; 4.3 balances phone accuracy's 19% base rate, and
     #: happens to suit word stress too — 20.0% of words draw at least one dissenting expert.
     detect_pos_weight: float = 4.3
+    #: Weight on the RAFT term, which supervises the grid expectation instead of the emitted
+    #: token. This is the whole score objective under `--raft-rail`, so it defaults to 1.0;
+    #: 0 leaves that arm with no score term at all and the config refuses it.
+    lambda_raft: float = 1.0
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.
@@ -286,6 +290,53 @@ def head_loss(
     return elementwise.mean(), head.predict_normalized(logits)
 
 
+def raft_loss(
+    supports: dict,
+    score_logits: dict[str, torch.Tensor],
+    heads: dict,
+    config: LossConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """RAFT: put the loss on the expectation, not on the token the model would sample.
+
+    Cross-entropy on the emitted token is the thing this arm exists to avoid. It rewards
+    putting mass on the one token matching the label, which on a saturated field means
+    collapsing onto the mode — and a collapsed distribution has no expectation worth reading,
+    which is the only thing RAIL then uses. Squaring the error of the expectation instead
+    trains the exact quantity the readout reports, and it puts gradient on the neighbouring
+    grid points a one-hot target leaves untouched.
+
+    Squared rather than log-cosh, unlike the head path. There the prediction is an unbounded
+    scalar and one outlier residual dominates the batch; here it is a mean over a fixed grid,
+    so the residual cannot leave the grid's own range and its gradient is bounded already.
+
+    Both sides are put on [-1, 1] by the **grid's** span, and the gold comes from `raw`, not
+    from `target`. `HeadBatch.target` is z-scored on the reported scale, which for
+    `word.stress` is the 5/10 median while the grid holds the 0-5 vote count; subtracting one
+    from the other would compare two quantities and still return a tidy number. `raw` is the
+    value the grid was built to name.
+    """
+    total: torch.Tensor | None = None
+    parts: dict[str, float] = {}
+    for key, logits in score_logits.items():
+        support, batch = supports.get(key), heads.get(key)
+        if support is None or batch is None or len(batch) == 0:
+            continue
+        level = key.split(".", 1)[0]
+        weight = config.level_weights.get(level, 1.0)
+        if weight == 0.0:
+            continue
+        residual = support.expectation_normalized(logits) - support.normalize_value(batch.raw)
+        term = (residual ** 2).mean()
+        total = term if total is None else total + weight * term
+        parts[f"raft/{key}"] = float(term.detach())
+    if total is None:
+        raise RuntimeError(
+            "raft_loss was asked for, but the batch carried no supervised score slot. Under "
+            "--raft-rail that means the run has no score objective at all."
+        )
+    return total, parts
+
+
 def composite_loss(
     head_bank,
     head_outputs: dict[str, torch.Tensor],
@@ -294,6 +345,8 @@ def composite_loss(
     buffer: CorrelationBuffer | None = None,
     reweighter: LabelReweighter | None = None,
     lm_loss: torch.Tensor | None = None,
+    score_logits: dict[str, torch.Tensor] | None = None,
+    supports: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """The full objective, and a flat dict of its parts for logging.
 
@@ -306,6 +359,8 @@ def composite_loss(
         # accelerator the batch is on. Starting the total on the CPU would make the first
         # `total + lambda * lm_loss` cross devices.
         device = lm_loss.device
+    if device is None and score_logits:
+        device = next(iter(score_logits.values())).device
     total = torch.zeros((), device=device) if device is not None else torch.zeros(())
     parts: dict[str, float] = {}
 
@@ -352,6 +407,12 @@ def composite_loss(
     if lm_loss is not None and config.lambda_lm > 0.0:
         total = total + config.lambda_lm * lm_loss
         parts["loss/lm"] = float(lm_loss.detach())
+
+    if score_logits and config.lambda_raft > 0.0:
+        raft, raft_parts = raft_loss(supports or {}, score_logits, heads, config)
+        total = total + config.lambda_raft * raft
+        parts.update(raft_parts)
+        parts["loss/raft"] = float(raft.detach())
 
     parts["loss/total"] = float(total.detach())
     return total, parts

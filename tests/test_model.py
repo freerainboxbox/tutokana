@@ -123,9 +123,9 @@ def test_register_delta_reaches_the_forward_pass(wired):
     batch = move_batch(collator(sample[:2]), CPU)
     model.eval()
     with torch.no_grad():
-        before, _ = model(batch)
+        before, _, _ = model(batch)
         model.register_delta.delta.add_(1.0)
-        after, _ = model(batch)
+        after, _, _ = model(batch)
         model.register_delta.delta.sub_(1.0)
     assert before.keys() == after.keys()
     for key in before:
@@ -145,7 +145,7 @@ def test_every_head_is_populated_and_the_loss_descends(wired):
     trajectory = []
     for _ in range(3):
         batch = move_batch(collator(sample), CPU)
-        head_outputs, lm_loss = model(batch)
+        head_outputs, lm_loss, _ = model(batch)
         assert set(head_outputs) == set(batch["heads"])
         loss, parts = composite_loss(
             model.heads, head_outputs, batch["heads"], config, buffer, reweighter, lm_loss
@@ -204,8 +204,8 @@ def test_scoring_skips_the_language_model_loss(wired):
     batch = move_batch(collator(sample[:2]), CPU)
     model.eval()
     with torch.no_grad():
-        trained_heads, lm_loss = model(batch, with_lm_loss=True)
-        scored_heads, no_loss = model(batch, with_lm_loss=False)
+        trained_heads, lm_loss, trained_grid = model(batch, with_lm_loss=True)
+        scored_heads, no_loss, scored_grid = model(batch, with_lm_loss=False)
 
     assert lm_loss is not None, "training still needs the text objective"
     assert no_loss is None, "scoring must not compute a loss it discards"
@@ -575,18 +575,21 @@ def test_expectation_is_not_the_sampled_token(emitted):
 
     support = grid_supports(emitted[1].grid_ids)["phone.accuracy"]
     torch.manual_seed(0)
-    logits = torch.randn(1, VOCAB) * 3.0
-    expectation = support.expectation(logits)
-    snapped = int(support.snap(expectation)[0])
+    full = torch.randn(1, VOCAB) * 3.0
+    snapped = int(support.snap(support.expectation(support.restrict(full)))[0])
     assert snapped in support.token_ids.tolist()
+
     # A skewed distribution puts the expectation between two grid points, so the token the
     # loop writes back is a rendering of the number, not the number the metrics report.
     skewed = torch.full((1, VOCAB), -20.0)
     for token, value in zip(support.token_ids.tolist(), support.values.tolist()):
         skewed[0, token] = -abs(value - 1.3)
-    assert float(support.expectation(skewed)) != float(
-        support.values[support.token_ids.tolist().index(int(support.snap(support.expectation(skewed))))]
-    )
+    grid_logits = support.restrict(skewed)
+    expectation = support.expectation(grid_logits)
+    landed = support.values[support.token_ids.tolist().index(int(support.snap(expectation)[0]))]
+    assert float(expectation) != float(landed)
+    # And the expectation is a weighted mean of the grid, so it is inside the grid.
+    assert support.values.min() <= float(expectation) <= support.values.max()
 
 
 def test_stress_reports_the_median_scale_not_the_vote_count(emitted):
@@ -599,15 +602,15 @@ def test_stress_reports_the_median_scale_not_the_vote_count(emitted):
 
     all_wrong = torch.full((1, VOCAB), -60.0)
     all_wrong[0, int(support.token_ids[0])] = 20.0
-    assert float(support.report(all_wrong)) == pytest.approx(5.0, abs=1e-4)
-
     all_right = torch.full((1, VOCAB), -60.0)
     all_right[0, int(support.token_ids[-1])] = 20.0
-    assert float(support.report(all_right)) == pytest.approx(10.0, abs=1e-4)
+    wrong, right = support.restrict(all_wrong), support.restrict(all_right)
 
+    assert float(support.report(wrong)) == pytest.approx(5.0, abs=1e-4)
+    assert float(support.report(right)) == pytest.approx(10.0, abs=1e-4)
     # The expectation, by contrast, is a vote count.
-    assert float(support.expectation(all_wrong)) == pytest.approx(0.0, abs=1e-4)
-    assert float(support.expectation(all_right)) == pytest.approx(5.0, abs=1e-4)
+    assert float(support.expectation(wrong)) == pytest.approx(0.0, abs=1e-4)
+    assert float(support.expectation(right)) == pytest.approx(5.0, abs=1e-4)
 
 
 def test_probabilities_are_renormalised_onto_the_grid(emitted):
@@ -616,9 +619,13 @@ def test_probabilities_are_renormalised_onto_the_grid(emitted):
 
     supports = grid_supports(emitted[1].grid_ids)
     support = supports["word.total"]
-    logits = torch.full((1, VOCAB), -60.0)
-    logits[0, support.token_ids.tolist()] = 2.0
-    assert float(support.probabilities(logits).sum()) == pytest.approx(1.0, abs=1e-6)
+    full = torch.full((1, VOCAB), -60.0)
+    full[0, support.token_ids.tolist()] = 2.0
+    probabilities = support.probabilities(support.restrict(full))
+    assert float(probabilities.sum()) == pytest.approx(1.0, abs=1e-6)
+    assert float(probabilities.max()) == pytest.approx(
+        1.0 / len(support.values), abs=1e-6
+    ), "uniform over the grid, and nothing else"
 
 
 def test_preflight_passes_on_the_emitted_path(emitted):
@@ -631,7 +638,7 @@ def test_ce_rail_loss_is_the_text_loss_alone(emitted):
     """No heads, so the composite objective is cross-entropy on the emitted text."""
     model, collator, sample = emitted
     batch = move_batch(collator(sample[:2]), CPU)
-    head_outputs, lm_loss = model(batch)
+    head_outputs, lm_loss, _ = model(batch)
     assert head_outputs == {}, "the emitted path must not build heads"
     total, parts = composite_loss(
         model.heads, head_outputs, batch["heads"], LossConfig(lambda_lm=0.5), None, None, lm_loss
@@ -650,9 +657,215 @@ def test_ce_rail_score_positions_carry_the_gradient(emitted):
     supervised = torch.isin(batch["input_ids"], grid) & (batch["labels"] != -100)
     assert int(supervised.sum()) > 0, "no score token is supervised"
 
-    _, lm_loss = model(batch)
+    _, lm_loss, _ = model(batch)
     lm_loss.backward()
     # The delta rows for the grid are the only trainable thing holding the score tokens'
     # output embeddings, so they must be the ones moving.
     assert model.register_delta.delta.grad is not None
     assert float(model.register_delta.delta.grad.abs().sum()) > 0.0
+
+
+# --- the RAFT arm: supervise the expectation, not the token ------------------------------
+
+
+@pytest.fixture
+def raft(tiny_base, processor, utterances):
+    """`--raft-rail`: the score token is masked out of the text loss and read off the grid."""
+    from peft import LoraConfig, get_peft_model
+
+    from tutokana.rail import grid_supports
+    from tutokana.tokens import register_grid_tokens
+
+    sample = utterances[:4]
+    stats = compute_target_stats(sample)
+    phones = phone_vocabulary(sample)
+    spec = TargetSpec(emit_scores=True)
+    tokenizer = processor.tokenizer
+    register_ids = register_tokens(tokenizer)
+    grid_ids = register_grid_tokens(tokenizer)
+    base = get_peft_model(
+        tiny_base,
+        LoraConfig(
+            r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+            task_type="CAUSAL_LM", target_modules=list(LORA_TARGET_MODULES),
+        ),
+    )
+    model = TutokanaModel(
+        base,
+        HeadBank(HIDDEN, {}, spec.levels, n_layers=3),
+        RegisterDelta({**register_ids, **grid_ids}, HIDDEN),
+        ModelConfig(head_layers=3, emitted_delta=True),
+        supports=grid_supports(grid_ids),
+    )
+    collator = Collator(
+        processor, spec, stats, phones, max_length=4096,
+        score_ce=False, grid_ids=grid_ids,
+    )
+    return model, collator, sample
+
+
+def test_scoring_skips_the_grid_gather(raft):
+    """The gather only feeds the training loss, and the logits it reads are the expensive ones."""
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    model.eval()
+    with torch.no_grad():
+        assert model(batch, with_lm_loss=True)[2] != {}
+        assert model(batch, with_lm_loss=False)[2] == {}
+
+
+def test_raft_loss_is_zero_at_the_gold_value(raft):
+    """A distribution with all its mass on the label's grid point has no error left."""
+    from tutokana.losses import raft_loss
+
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    for key, head_batch in batch["heads"].items():
+        support = model.supports[key]
+        gold = head_batch.raw
+        logits = torch.full((len(gold), len(support.token_ids)), -40.0)
+        for i, value in enumerate(gold.tolist()):
+            nearest = int(support.snap(torch.tensor([value]))[0])
+            logits[i, support.token_ids.tolist().index(nearest)] = 40.0
+        total, parts = raft_loss(model.supports, {key: logits}, batch["heads"], LossConfig())
+        assert float(total) < 1e-3, (key, float(total))
+        assert f"raft/{key}" in parts
+
+
+def test_raft_loss_reaches_the_parameters_that_emit_scores(raft):
+    """The score token's output row is the delta, so the delta must be what moves."""
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    _, lm_loss, gathered = model(batch)
+    loss, parts = composite_loss(
+        model.heads, {}, batch["heads"], LossConfig(lambda_lm=0.0, lambda_raft=1.0),
+        None, None, None, score_logits=gathered, supports=model.supports,
+    )
+    assert "loss/raft" in parts
+    assert float(loss.detach()) > 0.0
+    loss.backward()
+    assert model.register_delta.delta.grad is not None
+    assert float(model.register_delta.delta.grad.abs().sum()) > 0.0
+
+
+def test_raft_total_ignores_the_masked_text_token(raft):
+    """The arm's whole premise: no cross-entropy on the score, and the grid term carries it."""
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    grid = torch.tensor(sorted(collator.grid_ids.values()))
+    on_grid = torch.isin(batch["input_ids"], grid)
+    assert on_grid.any()
+    assert (batch["labels"][on_grid] == -100).all(), "the score token must be out of the CE mask"
+
+    _, lm_loss, gathered = model(batch)
+    _, parts = composite_loss(
+        model.heads, {}, batch["heads"], LossConfig(lambda_lm=0.5),
+        None, None, lm_loss, score_logits=gathered, supports=model.supports,
+    )
+    assert {"loss/lm", "loss/raft", "loss/total"} <= set(parts)
+
+
+def test_head_path_gathers_nothing(wired):
+    """The regression-head path must not pay for a grid it never reads."""
+    model, collator, sample = wired
+    batch = move_batch(collator(sample[:2]), CPU)
+    assert model.supports == {}
+    assert model(batch)[2] == {}
+
+
+def test_raft_loss_without_slots_is_an_error_not_a_zero(raft):
+    """A silent zero here would be a run with no score objective, reported as a clean loss."""
+    from tutokana.losses import raft_loss
+
+    with pytest.raises(RuntimeError, match="no supervised score slot"):
+        raft_loss({}, {}, {}, LossConfig())
+
+
+def test_the_trigger_row_is_the_one_that_predicts_the_next_token(raft):
+    """The convention the whole alignment rests on, pinned rather than assumed.
+
+    `test_grid_logits_are_read_at_the_trigger_not_the_score` pins the gather against the raw
+    logits at the trigger. This pins the other half: that the row at `p` is the distribution
+    over `p + 1`, by recomputing the model's own text loss with that shift and matching it.
+    Together they leave no room for an off-by-one, which no shape check would catch.
+    """
+    import torch.nn.functional as F
+
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    _, lm_loss, _ = model(batch)
+    with torch.no_grad():
+        logits = model.base(input_ids=batch["input_ids"], use_cache=False).logits
+
+    labels = batch["labels"]
+    supervised = labels[:, 1:] != -100
+    picked = logits[:, :-1][supervised].float()
+    targets = labels[:, 1:][supervised]
+    manual = F.cross_entropy(picked, targets)
+    assert float(manual) == pytest.approx(float(lm_loss.detach()), rel=1e-4)
+
+
+def test_grid_logits_are_read_at_the_trigger_not_the_score(raft):
+    """One index off and the loss would train the distribution that predicts the *next* field.
+
+    Nothing else would notice: the shapes stay right and the loss still descends, because a
+    causal model leaks the answer sideways anyway. So this is asserted against the gather the
+    test does itself, row by row.
+    """
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    _, _, gathered = model(batch)
+    assert gathered, "the RAFT path produced no grid logits"
+
+    with torch.no_grad():
+        logits = model.base(input_ids=batch["input_ids"], use_cache=False).logits
+    checked = 0
+    for key, rows in gathered.items():
+        positions = batch["heads"][key].positions
+        columns = model.supports[key].token_ids
+        assert rows.shape == (len(positions), len(columns)), key
+        for i, (b, position) in enumerate(positions.tolist()):
+            assert torch.allclose(rows[i], logits[b, position, columns], atol=1e-6), key
+            # The score token is the very next id, and it is one of these columns.
+            score = int(batch["input_ids"][b, position + 1])
+            assert score in columns.tolist(), key
+            checked += 1
+    assert checked > 0
+
+
+def test_preflight_passes_on_the_raft_path(raft):
+    """The preflight is what stands between a flag and thirty hours of nothing.
+
+    Under `--raft-rail` it is the only place that exercises the grid gather, the RAFT term and
+    the masked text loss together before a run starts, so it is asserted rather than assumed.
+    """
+    model, collator, sample = raft
+    preflight(model, collator, sample[:2], CPU, LossConfig(), None)
+
+
+def test_raft_loss_descends_when_stepped_on_the_grid(raft):
+    """Not a quality claim: proof that the term is a function the optimiser can climb.
+
+    A term that is constant, or whose gradient never reaches the logits, trains nothing and
+    still logs a plausible number. So: fit one field's grid logits directly and watch the
+    residual fall.
+    """
+    from tutokana.losses import raft_loss
+
+    model, collator, sample = raft
+    batch = move_batch(collator(sample[:2]), CPU)
+    key = "phone.accuracy"
+    support = model.supports[key]
+    head_batch = batch["heads"][key]
+    logits = torch.zeros(len(head_batch), len(support.token_ids), requires_grad=True)
+    optimizer = torch.optim.Adam([logits], lr=0.2)
+
+    first = None
+    for _ in range(60):
+        optimizer.zero_grad()
+        loss, _ = raft_loss(model.supports, {key: logits}, batch["heads"], LossConfig())
+        loss.backward()
+        optimizer.step()
+        if first is None:
+            first = float(loss.detach())
+    assert float(loss.detach()) < first / 10, (first, float(loss.detach()))

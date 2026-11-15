@@ -66,6 +66,16 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 - One utterance at a time. Reinjection makes the turn sequential, so a batch would have to advance in lockstep across utterances whose triggers sit in different places, and padding to the longest would write pad tokens into the cache and change what every later token attends to.
 - `engine.score` dispatches on the collator, so no caller can pick the wrong channel. Scoring a RAIL run with the head reader would return an empty table rather than an error.
 
+**The RAFT term**
+
+- `--raft-rail` masks the score token out of the text loss and instead squares the error of the grid expectation. Cross-entropy rewards putting mass on the one token matching the label, which on a saturated field means collapsing onto the mode. A collapsed distribution has no expectation worth reading, and the expectation is the only thing RAIL reports.
+- The grid term puts gradient on the neighbouring grid points a one-hot target leaves untouched. That is the arm's whole claim, and `--ce-rail` is the control that measures whether it is worth anything.
+- Squared rather than log-cosh, unlike the head path. There the prediction is an unbounded scalar and one outlier residual dominates the batch. Here it is a mean over a fixed grid, so the residual cannot leave the grid's own span and its gradient is bounded already.
+- The gold comes from `HeadBatch.raw`, and both sides are scaled by the **grid's** span rather than by `TargetStats`. `TargetStats` speaks the reported scale, which for `word.stress` is the 5/10 median while the grid holds the 0-5 vote count. Subtracting one from the other would compare two quantities and still return a tidy number.
+- `GridSupport` takes logits **already restricted to the grid, in grid order**, everywhere. A function that guessed which of the two it was handed would be a bug waiting for the widths to be confused, and `(..., G)` is easy to pass where `(..., vocab)` was meant.
+- The loss reads logits gathered at the **trigger**, because in a causal model the row at `p` is the distribution over `p + 1`, where the score token sits. Two tests close that gap from both sides: one pins the gather against the raw logits at the trigger, and one recomputes the model's own text loss with the shift and matches it. An off-by-one would leave every shape right and the loss still descending.
+- The head path gathers nothing and pays nothing: `model.supports` is empty there, and `with_lm_loss=False` skips the gather entirely.
+
 **Ordering**
 
 - The model uses one unified turn: phones → word registers → utterance registers. It uses causal masking from the bottom up. Word registers see their phones, and utterance registers see all previous data.
@@ -240,16 +250,16 @@ Each ablation is a flag. The defaults use the current best configuration. Every 
 
 A variant changes the output channel rather than a term inside it, so it is not a subtraction from the current model. It is a different model that shares the data path, the turn shape and the evaluation.
 
-**Neither arm has a run yet.** `--ce-rail` trains and scores end to end. `--raft-rail` still stops before anything is loaded. Neither has produced a number, so nothing here is a result:
+**Both arms run. Neither has a number yet.** `--ce-rail` and `--raft-rail` both train and score end to end. No run has been launched, so nothing below is a result:
 
 | flag | training loss | inference | status |
 | --- | --- | --- | --- |
-| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | implemented, no run yet |
-| `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | parses, refuses |
+| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | runs, no result yet |
+| `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | runs, no result yet |
 
-`--ce-rail` needs `--lambda-lm` above zero: cross-entropy on the emitted token is its only score supervision, and the config refuses the combination. `--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
+Each arm needs its own score term switched on: `--ce-rail` needs `--lambda-lm` above zero and `--raft-rail` needs `--lambda-raft` above zero, because for each one that term is the only score supervision the arm has. The config refuses both combinations rather than running for hours on an objective with no score in it. `--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
 
-An unimplemented arm names what is still missing, which is the point of accepting its flag early: a parsed flag nothing reads would train the head model, write `variant: raft_rail` into its own record, and be indistinguishable from a real result.
+A flag for an arm that cannot yet train refuses before anything loads, and names what is missing. That guard is empty now and stays as the mechanism: a parsed flag nothing reads would train the head model, record the variant in its own `config.json`, and be indistinguishable from a real result.
 
 Both arms share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
 
@@ -258,11 +268,11 @@ That reinjection is the point. Without it the model is a feature extractor with 
 - `--ce-rail` changes only the decision rule. RAIL fixes how a value is read out, but it cannot repair a distribution that cross-entropy already made mode-seeking. On word stress this arm is **predicted to lose**, and a loss here is a result rather than a bug.
 - `--raft-rail` changes the objective, so the trained distribution matches the one the readout assumes. This is where the paper's argument applies.
 
-Three consequences to carry into any implementation:
+Three properties the arms were built around:
 
 - **Read the score from the grid distribution, not from the emitted token.** One sampled token keeps about half the achievable correlation, and 16 averaged samples keep about 87%. Report the expectation at the trigger position, and let the token be a rendering.
 - **`word.stress` scores on the vote-count grid and reports on the 5/10 median.** The released label is the median of five annotators, and 99% of it is one value. Training on it recreates the collapse the `binomial` head exists to avoid. Reporting still maps through `P(votes >= 3)`.
-- **Reinjection makes the coupling between fields bidirectional.** `--stress-siblings` detaches its gradient so a 1%-of-words loss cannot damage two working columns. A text stream has no such detach. That protection is gone in both variants, and the run notes should say so.
+- **Reinjection makes the coupling between fields bidirectional.** `--stress-siblings` detaches its gradient so a 1%-of-words loss cannot damage two working columns. A text stream has no such detach, and nothing in the emitted path replaces it. That protection is gone in both arms, and a run's notes should say so.
 
 Comparing a variant against the **Results** table is not apples to apples. The table is teacher-forced. A variant feeds its own emitted tokens back, so it should be reported with its own row and its own protocol note.
 
@@ -278,6 +288,7 @@ src/tutokana/
   heads.py        score heads, layer mixture, conditioning
   model.py        base + LoRA + register delta + heads
   losses.py       the composite objective
+  rail.py         grid readout: restrict, expect, snap, report
   engine.py       preflight, training, scoring, resume
   metrics.py      correlations, detection, ceilings
   reporting.py    result tables

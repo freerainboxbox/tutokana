@@ -222,12 +222,16 @@ class TutokanaModel(nn.Module):
         head_bank: HeadBank,
         register_delta: RegisterDelta,
         config: ModelConfig,
+        supports: dict | None = None,
     ):
         super().__init__()
         self.base = base
         self.heads = head_bank
         self.register_delta = register_delta
         self.config = config
+        #: {`level.field`: GridSupport}. Empty on the regression-head path, which never needs
+        #: a logit restricted to a grid, and so never pays for gathering one.
+        self.supports = dict(supports or {})
         self._delta_handle = register_delta.attach(base.get_input_embeddings())
         self._delta_output_handle = None
         if config.emitted_delta:
@@ -241,13 +245,18 @@ class TutokanaModel(nn.Module):
 
     def forward(
         self, batch: dict, *, with_lm_loss: bool = True
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
-        """Read every head from one pass.
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Read every head from one pass, and gather the grid logits the RAFT loss needs.
+
+        Returns `(head_outputs, lm_loss, score_logits)`. Hidden states are requested for every
+        layer only when a head bank will actually read them; the heads consume a learned
+        mixture over a window of them, not just the last one.
 
         `with_lm_loss=False` skips the text objective, which scoring discards anyway. Passing
-        `labels` materialises logits over the full 262144-token vocabulary — 5.5 GB in fp32
-        at batch 8, sequence 700, scaling with both — so this is the difference between an
-        eval pass measured in minutes and one measured in hours.
+        `labels` makes the loss materialise the logits in fp32 — 5.5 GB at batch 8, sequence
+        700, scaling with both — so this is the difference between an eval pass measured in
+        minutes and one measured in hours. It also skips the grid gather, which only the
+        training loss reads.
         """
         input_ids = batch["input_ids"]
         # A RAIL/RAFT run has an empty head bank, and asking for every layer's hidden state is
@@ -279,7 +288,36 @@ class TutokanaModel(nn.Module):
             if reads_heads
             else {}
         )
-        return head_outputs, getattr(outputs, "loss", None)
+        score_logits = (
+            self._grid_logits(batch, getattr(outputs, "logits", None)) if with_lm_loss else {}
+        )
+        return head_outputs, getattr(outputs, "loss", None), score_logits
+
+    def _grid_logits(self, batch: dict, logits) -> dict[str, torch.Tensor]:
+        """{key: (M, G)} logits over one field's grid, at the position predicting its score.
+
+        Gathered out of logits the text loss already produced, so this costs the pass nothing
+        beyond (M, G). The row is the **trigger** position: in a causal model the logit at `p`
+        is the distribution over `p + 1`, which is where the score token sits.
+
+        Restricted to the grid before anything reads it, so the softmax downstream is the grid
+        distribution by construction and no caller can accidentally renormalise over the whole
+        vocabulary.
+        """
+        if not self.supports or logits is None:
+            return {}
+        gathered: dict[str, torch.Tensor] = {}
+        for key, head_batch in batch.get("heads", {}).items():
+            support = self.supports.get(key)
+            if support is None or len(head_batch) == 0:
+                continue
+            rows = head_batch.positions
+            columns = support.token_ids.to(logits.device)
+            # (M,1), (M,1), (1,G) broadcast to (M,G): one grid-width row per score slot.
+            gathered[key] = logits[
+                rows[:, 0][:, None], rows[:, 1][:, None], columns[None, :]
+            ]
+        return gathered
 
     def trainable_parameters(self) -> tuple[int, int]:
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -348,6 +386,7 @@ def build_model(
     trainable_adapter: bool = False,
     grid_ids: dict[str, int] | None = None,
     tokenizer=None,
+    supports: dict | None = None,
 ) -> TutokanaModel:
     """Load the base model, attach LoRA (or a saved adapter), heads and register delta.
 
@@ -432,7 +471,7 @@ def build_model(
         )
     register_delta = RegisterDelta(all_ids, hidden_size, init=delta_init)
 
-    model = TutokanaModel(base, head_bank, register_delta, config)
+    model = TutokanaModel(base, head_bank, register_delta, config, supports=supports)
     model.heads.to(device=device, dtype=torch.float32)
     model.register_delta.to(device=device, dtype=torch.float32)
     model.base.to(device)

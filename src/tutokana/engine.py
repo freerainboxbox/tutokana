@@ -126,9 +126,10 @@ def preflight(model, collator, samples: list[Utterance], device, loss_config: Lo
         raise SystemExit("[preflight] language-model loss mask is empty")
 
     model.train()
-    head_outputs, lm_loss = model(batch)
+    head_outputs, lm_loss, score_logits = model(batch)
     total, parts = composite_loss(
-        model.heads, head_outputs, batch["heads"], loss_config, buffer, reweighter, lm_loss
+        model.heads, head_outputs, batch["heads"], loss_config, buffer, reweighter, lm_loss,
+        score_logits=score_logits, supports=model.supports,
     )
     total.backward()
 
@@ -225,7 +226,7 @@ def _score_teacher_forced(
 
     for chunk in batches(utterances, batch_size):
         batch = move_batch(collator(chunk), device)
-        head_outputs, _ = model(batch, with_lm_loss=False)
+        head_outputs, _, _ = model(batch, with_lm_loss=False)
         for key, logits in head_outputs.items():
             head = model.heads.head(key)
             prediction = head.predict_native(logits).float().cpu().numpy()
@@ -311,10 +312,11 @@ def emitted_row(model, batch: dict, supports: dict) -> dict[str, torch.Tensor]:
             use_cache=True,
             **first,
         )
-        logits = outputs.logits[:, -1, :]
-        read[key][row] = support.report(logits)[0].float().cpu()
+        # Restricted to the grid once, here, so every readout downstream sees one shape.
+        grid_logits = support.restrict(outputs.logits[:, -1, :])
+        read[key][row] = support.report(grid_logits)[0].float().cpu()
         # Snap and write back, so the next segment is conditioned on this score.
-        ids[position + 1] = int(support.snap(support.expectation(logits))[0])
+        ids[position + 1] = int(support.snap(support.expectation(grid_logits))[0])
         cache = outputs.past_key_values
         consumed = position + 1
     return read

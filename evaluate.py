@@ -40,6 +40,7 @@ from tutokana.metrics import (
 )
 from tutokana.model import ModelConfig, build_model, load_processor, resolve_device
 from tutokana.prompting import TargetSpec, parse_generated
+from tutokana.rail import grid_supports
 from tutokana.progress import Progress
 from tutokana.reporting import (
     render_baselines,
@@ -195,6 +196,7 @@ def main() -> None:
             adapter_dir=None if untuned else run_dir / "adapter",
             grid_ids=grid_ids,
             tokenizer=tokenizer,
+            supports=grid_supports(grid_ids) if grid_ids else {},
         )
         if untuned:
             run_id = f"{run_id}-UNTUNED"

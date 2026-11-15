@@ -42,6 +42,20 @@ class GridSupport:
     field: str
     token_ids: torch.Tensor
     values: torch.Tensor
+    #: The grid's own ends. The loss normalises on these rather than on `TargetStats`, because
+    #: `TargetStats` speaks the *reported* scale and for `word.stress` that is the 5/10 median
+    #: while the grid holds the 0-5 vote count. Normalising a vote expectation by median
+    #: statistics would compare two different quantities and still produce a tidy number.
+    low: float = 0.0
+    high: float = 1.0
+
+    @property
+    def mid(self) -> float:
+        return (self.low + self.high) / 2.0
+
+    @property
+    def half(self) -> float:
+        return (self.high - self.low) / 2.0
 
     @property
     def key(self) -> str:
@@ -50,18 +64,40 @@ class GridSupport:
     def _values(self, like: torch.Tensor) -> torch.Tensor:
         return self.values.to(like.device, dtype=like.dtype)
 
+    def restrict(self, logits: torch.Tensor) -> torch.Tensor:
+        """Pull this grid's columns out of a full-vocabulary logit vector.
+
+        Every other method here takes logits **already restricted to the grid, in grid order**.
+        One contract, because a function that guessed which of the two it was handed would be
+        a bug waiting for the two widths to coincide — and on a 22-token grid over a 262144
+        vocabulary, `(..., G)` and `(..., vocab)` are easy to pass by accident.
+        """
+        return logits[..., self.token_ids.to(logits.device)]
+
     def probabilities(self, logits: torch.Tensor) -> torch.Tensor:
         """The next-token distribution, renormalised onto the grid.
 
         Restricting first is what "the grid distribution" means: mass sitting on the rest of
-        the 262144-token vocabulary is not part of the score, and leaving it in the
-        denominator would shrink every prediction toward zero.
+        the 262144-token vocabulary is not part of the score, and leaving it in the denominator
+        would shrink every prediction toward zero.
         """
-        return torch.softmax(logits[..., self.token_ids.to(logits.device)], dim=-1)
+        return torch.softmax(logits, dim=-1)
 
     def expectation(self, logits: torch.Tensor) -> torch.Tensor:
         """The score, on the grid's own scale."""
         return (self.probabilities(logits) * self._values(logits)).sum(dim=-1)
+
+    def expectation_normalized(self, logits: torch.Tensor) -> torch.Tensor:
+        """The expectation scaled onto [-1, 1] by the grid's own span.
+
+        Scaling by the span rather than leaving the raw number is what lets a 0.0-2.0 field and
+        a 0-10 one contribute the same order of magnitude to a single objective.
+        """
+        return (self.expectation(logits) - self.mid) / self.half
+
+    def normalize_value(self, values: torch.Tensor) -> torch.Tensor:
+        """Put a gold label on the same [-1, 1] scale `expectation_normalized` speaks."""
+        return (values.to(self._values(values).dtype) - self.mid) / self.half
 
     def report(self, logits: torch.Tensor) -> torch.Tensor:
         """The score on the scale the field is published on, which is what metrics read."""
@@ -101,5 +137,7 @@ def grid_supports(grid_ids: dict[str, int]) -> dict[str, GridSupport]:
             field=field,
             token_ids=torch.tensor([grid_ids[s] for s in strings], dtype=torch.long),
             values=torch.tensor(grid.values, dtype=torch.float32),
+            low=grid.low,
+            high=grid.high,
         )
     return supports

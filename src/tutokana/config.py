@@ -39,14 +39,9 @@ VARIANTS = ("heads", "ce_rail", "raft_rail")
 #: What each variant still needs before it can train. The guard exists because a parsed flag
 #: that nothing reads is worse than no flag: the run would train the head model, record
 #: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
-#: An arm leaves this dict when its last piece lands; `ce_rail` left it with the decode loop.
-NOT_IMPLEMENTED = {
-    "raft_rail": (
-        "the RAFT loss in losses.py (squared error of the grid expectation)",
-        "the decode loop that takes the expectation over the grid, snaps it to the nearest "
-        "grid token and feeds that token back",
-    ),
-}
+#: Every arm has now landed, so this is empty and stays as the mechanism rather than a list.
+#: A future arm that is committed half-built goes in here, and its flag refuses until it does.
+NOT_IMPLEMENTED: dict[str, tuple[str, ...]] = {}
 
 
 @dataclass(frozen=True)
@@ -117,6 +112,9 @@ class Config:
     reweight_max: float = 10.0
     lambda_detect: float = 0.5
     detect_pos_weight: float = 4.3
+    #: Weight on the grid-expectation term. Under `--raft-rail` this is the only score
+    #: supervision the run has.
+    lambda_raft: float = 1.0
     stress_concentration: float = 8.6
     stress_siblings: bool = False
     reweight_levels: tuple[str, ...] = ("phone",)
@@ -145,6 +143,14 @@ class Config:
             raise SystemExit(
                 "--ce-rail with --lambda-lm 0 trains nothing: cross-entropy on the emitted "
                 "score token is the only score supervision that arm has."
+            )
+        # The mirror case. `--raft-rail` masks the score token out of the text loss on
+        # purpose, so the grid term is not merely one term among several there.
+        if self.variant == "raft_rail" and self.lambda_raft <= 0.0:
+            raise SystemExit(
+                "--raft-rail with --lambda-raft 0 trains nothing: the grid expectation is "
+                "the only score supervision that arm has, and its token is masked out of "
+                "the text loss by design."
             )
 
     @property

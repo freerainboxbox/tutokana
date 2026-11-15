@@ -69,6 +69,7 @@ from tutokana.model import (
     save_run_metadata,
 )
 from tutokana.prompting import TargetSpec
+from tutokana.rail import grid_supports
 from tutokana.progress import Progress, memory_note
 from tutokana.reporting import wandb_metrics
 from tutokana.tokens import register_grid_tokens, register_tokens
@@ -193,6 +194,9 @@ def main() -> None:
         # Registered once here and handed to the collator: under a variant the delta needs the
         # grid rows, and registering twice would only make the id source ambiguous.
         grid_ids = register_grid_tokens(tokenizer) if config.emits_scores else None
+        # The grid supports are the loss's view of the same grid the renderer emits: one
+        # source, so the columns the loss reads are the columns the text carries.
+        supports = grid_supports(grid_ids) if grid_ids else {}
         # A variant replaces the output channel rather than adding to it. With the scores in
         # the text, a head reading the same field would be a second channel in the same run,
         # and the arm would no longer be the one the README describes.
@@ -234,6 +238,7 @@ def main() -> None:
             trainable_adapter=resume_meta is not None,
             grid_ids=grid_ids,
             tokenizer=tokenizer,
+            supports=supports,
         )
         if resume_meta is not None:
             model.load_trained(run_dir)
@@ -261,6 +266,7 @@ def main() -> None:
             reweight_max=config.reweight_max,
             lambda_detect=config.lambda_detect,
             detect_pos_weight=config.detect_pos_weight,
+            lambda_raft=config.lambda_raft,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
         buffer = CorrelationBuffer(loss_config.buffer_capacity)
@@ -349,10 +355,11 @@ def main() -> None:
                     batches(shuffled[consumed:], config.train.batch_size)
                 ):
                     batch = move_batch(collator(chunk), device)
-                    head_outputs, lm_loss = model(batch)
+                    head_outputs, lm_loss, score_logits = model(batch)
                     loss, parts = composite_loss(
                         model.heads, head_outputs, batch["heads"], loss_config,
                         buffer, reweighter, lm_loss,
+                        score_logits=score_logits, supports=model.supports,
                     )
                     (loss / config.train.grad_accum).backward()
                     window_loss += parts["loss/total"]

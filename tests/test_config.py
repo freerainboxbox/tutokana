@@ -125,28 +125,29 @@ def test_the_heads_path_needs_nothing():
     assert Config().require_implemented() is None
 
 
-@pytest.mark.parametrize("variant", sorted(NOT_IMPLEMENTED))
-def test_an_unimplemented_variant_stops_before_anything_is_trained(variant):
+def test_an_unimplemented_arm_refuses_and_names_the_gap(monkeypatch):
+    """The guard is a mechanism, not a list that empties out and goes untested.
+
+    Every real arm is implemented now, so the behaviour is exercised on a stand-in: a flag
+    that parses, records itself in `config.json`, and then quietly trains something else is
+    the failure this exists to prevent, and it stays prevented for the next half-built arm.
+    """
+    monkeypatch.setitem(
+        NOT_IMPLEMENTED, "ce_rail", ("the decode loop that feeds the score back",)
+    )
     with pytest.raises(SystemExit) as excinfo:
-        Config(variant=variant).require_implemented()
+        Config(variant="ce_rail").require_implemented()
     message = str(excinfo.value)
     assert "Nothing was trained" in message
-    assert variant in message
-
-
-def test_the_refusal_says_what_is_still_missing():
-    """A named gap is the difference between a stub and a mystery."""
-    with pytest.raises(SystemExit) as excinfo:
-        Config(variant="raft_rail").require_implemented()
-    message = str(excinfo.value)
-    assert "RAFT loss" in message
     assert "decode loop" in message
+    assert "without --ce-rail" in message
 
 
-def test_ce_rail_is_implemented_and_no_longer_refuses():
-    """The arm runs end to end: emitted tokens, the mask, and the reinjection loop."""
-    assert "ce_rail" not in NOT_IMPLEMENTED
-    assert Config(variant="ce_rail").require_implemented() is None
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_every_declared_variant_runs(variant):
+    """No arm is left half-built behind a flag that looks usable."""
+    assert NOT_IMPLEMENTED.get(variant) is None
+    assert Config(variant=variant).require_implemented() is None
 
 
 def test_ce_rail_without_a_text_loss_would_train_nothing():
@@ -155,16 +156,11 @@ def test_ce_rail_without_a_text_loss_would_train_nothing():
         Config(variant="ce_rail", lambda_lm=0.0)
 
 
-def test_the_refusal_offers_the_command_that_works():
-    with pytest.raises(SystemExit, match="without --raft-rail"):
-        Config(variant="raft_rail").require_implemented()
-
-
-def test_every_variant_is_declared_one_way_or_the_other():
-    """An arm is either listed as missing something or it runs. Never neither."""
+def test_only_declared_variants_can_be_listed_as_missing(monkeypatch):
+    """A typo in the guard must not create a phantom arm that nothing can select."""
     assert set(NOT_IMPLEMENTED) <= set(VARIANTS)
-    assert "heads" not in NOT_IMPLEMENTED
-    assert set(NOT_IMPLEMENTED) | {"heads"} | {"ce_rail"} == set(VARIANTS)
+    monkeypatch.setitem(NOT_IMPLEMENTED, "ce_rails", ("oops",))
+    assert "ce_rails" not in VARIANTS
 
 
 def test_emits_scores_is_the_single_switch_downstream_code_reads():
