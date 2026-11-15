@@ -36,11 +36,11 @@ VARIANTS = ("heads", "ce_rail", "raft_rail")
 #: What each variant still needs before it can train. The guard exists because a parsed flag
 #: that nothing reads is worse than no flag: the run would train the head model, record
 #: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
+#: What each variant still needs before it can train. The guard exists because a parsed flag
+#: that nothing reads is worse than no flag: the run would train the head model, record
+#: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
+#: An arm leaves this dict when its last piece lands; `ce_rail` left it with the decode loop.
 NOT_IMPLEMENTED = {
-    "ce_rail": (
-        "the decode loop that takes the expectation over the grid, snaps it to the nearest "
-        "grid token and feeds that token back",
-    ),
     "raft_rail": (
         "the RAFT loss in losses.py (squared error of the grid expectation)",
         "the decode loop that takes the expectation over the grid, snaps it to the nearest "
@@ -137,6 +137,14 @@ class Config:
         if self.variant not in VARIANTS:
             raise SystemExit(
                 f"unknown variant {self.variant!r}; known variants: {', '.join(VARIANTS)}"
+            )
+        # Under `--ce-rail` the emitted token is the only thing carrying a score, and that
+        # token is trained by cross-entropy. Zeroing the text loss would leave the objective
+        # with no score term at all and run for hours doing nothing.
+        if self.variant == "ce_rail" and self.lambda_lm <= 0.0:
+            raise SystemExit(
+                "--ce-rail with --lambda-lm 0 trains nothing: cross-entropy on the emitted "
+                "score token is the only score supervision that arm has."
             )
 
     @property

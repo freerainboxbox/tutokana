@@ -56,6 +56,16 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 - A variant builds no regression heads. The scores are in the text, so a head on the same field would be a second channel in one run. The arm would then not be the one documented under **Variants**. The collator still emits per-field positions and gold, because scoring and the RAFT loss both need them, so `HeadBank.read` skips keys the bank does not hold. With an empty bank the forward pass also stops requesting hidden states, which is the largest activation in the pass.
 - Both arms emit byte-identical text. They differ only in the mask, so a difference in results cannot come from the data.
 
+**Reading the grid and feeding it back**
+
+- A score is not the token the model samples. It is the **expectation** of the next-token distribution, restricted to that type's grid and renormalised over it. `rail.GridSupport` does the restriction, the expectation and the snap, and derives every grid from `SCORE_GRID`. Mass on the rest of the vocabulary stays out of the denominator: leaving it in would shrink every prediction toward zero.
+- The expectation is continuous and the stream is not, so it is **snapped** to the nearest grid token and written back. That reinjection is what makes this a unified model rather than a feature extractor with a regressor bolted on. `test_reinjection_changes_the_readout` asserts it: bias one phone score token and the last utterance score must move.
+- `GridSupport.report` is what the metrics read, and it differs from the expectation for exactly one field. `word.stress` grids the vote count, so the readout is `P(votes >= 3)` mapped onto the published 5/10 median. The `binomial` head applies the same mapping, which is what keeps the two channels comparable.
+- Scoring teacher-forces the transcript and generates only the scores. The published protocol fixes the phone sequence, so a model writing its own phones would misalign a few percent of registers and the phone correlation would stop meaning what the baselines mean. The reinjection stays real, because each emitted score changes what every later token attends to.
+- The loop walks the turn left to right and feeds one segment per trigger, so the KV cache carries the rest. That is one forward pass per score rather than per token, and each pass adds the one to three tokens between two triggers.
+- One utterance at a time. Reinjection makes the turn sequential, so a batch would have to advance in lockstep across utterances whose triggers sit in different places, and padding to the longest would write pad tokens into the cache and change what every later token attends to.
+- `engine.score` dispatches on the collator, so no caller can pick the wrong channel. Scoring a RAIL run with the head reader would return an empty table rather than an error.
+
 **Ordering**
 
 - The model uses one unified turn: phones → word registers → utterance registers. It uses causal masking from the bottom up. Word registers see their phones, and utterance registers see all previous data.
@@ -230,16 +240,16 @@ Each ablation is a flag. The defaults use the current best configuration. Every 
 
 A variant changes the output channel rather than a term inside it, so it is not a subtraction from the current model. It is a different model that shares the data path, the turn shape and the evaluation.
 
-**Neither arm can run yet.** Both flags parse, are recorded in `config.json` and are diffed on resume, so a run states which channel it trained. What is not built is the training and inference path, so both arms stop before anything is loaded:
+**Neither arm has a run yet.** `--ce-rail` trains and scores end to end. `--raft-rail` still stops before anything is loaded. Neither has produced a number, so nothing here is a result:
 
 | flag | training loss | inference | status |
 | --- | --- | --- | --- |
-| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | parses, refuses |
+| `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | implemented, no run yet |
 | `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | parses, refuses |
 
-`--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
+`--ce-rail` needs `--lambda-lm` above zero: cross-entropy on the emitted token is its only score supervision, and the config refuses the combination. `--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
 
-The refusal names what is still missing, which is the point of accepting the flag early: a parsed flag nothing reads would train the head model, write `variant: ce_rail` into its own record, and be indistinguishable from a real result.
+An unimplemented arm names what is still missing, which is the point of accepting its flag early: a parsed flag nothing reads would train the head model, write `variant: raft_rail` into its own record, and be indistinguishable from a real result.
 
 Both arms share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
 

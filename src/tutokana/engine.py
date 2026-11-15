@@ -34,6 +34,7 @@ from .data import Utterance
 from .losses import LossConfig, composite_loss
 from .metrics import FieldMetrics, field_metrics
 from .progress import Progress, memory_note
+from .rail import grid_supports
 
 logger = get_logger()
 
@@ -174,6 +175,34 @@ def score(
     progress: "Progress | None" = None,
     interrupt: dict | None = None,
 ) -> ScoreResult:
+    """Score `utterances`, by whichever channel the run's collator describes.
+
+    One entry point on purpose. The two channels are different measurements, and a caller that
+    had to remember which one to call is a caller that can quietly score a RAIL run with the
+    head reader and get an empty table back.
+    """
+    if collator.spec.emit_scores:
+        return score_emitted(
+            model, collator, utterances, device,
+            bootstrap=bootstrap, progress=progress, interrupt=interrupt,
+        )
+    return _score_teacher_forced(
+        model, collator, utterances, device,
+        batch_size=batch_size, bootstrap=bootstrap, progress=progress, interrupt=interrupt,
+    )
+
+
+@torch.no_grad()
+def _score_teacher_forced(
+    model,
+    collator,
+    utterances: list[Utterance],
+    device,
+    batch_size: int = 8,
+    bootstrap: bool = True,
+    progress: "Progress | None" = None,
+    interrupt: dict | None = None,
+) -> ScoreResult:
     """Teacher-forced scoring: one forward pass per batch, every head read at once.
 
     The canonical phones come from the dataset, so every phone register aligns one-to-one
@@ -211,6 +240,130 @@ def score(
             stopped = True
             break
 
+    predictions = {k: np.concatenate([p for p, _ in v]) for k, v in collected.items()}
+    gold = {k: np.concatenate([g for _, g in v]) for k, v in collected.items()}
+    metrics = {
+        key: field_metrics(predictions[key], gold[key], bootstrap=bootstrap)
+        for key in predictions
+    }
+    return ScoreResult(
+        metrics=metrics, predictions=predictions, gold=gold,
+        scored=scored, partial=stopped,
+    )
+
+
+# --- emitted-score scoring (RAIL) ------------------------------------------------------
+
+#: What the multimodal front end needs on the first forward, and nothing needs after: the
+#: audio is scattered into the embeddings once, and the KV cache carries the result.
+_AUDIO_KEYS = ("input_features", "input_features_mask", "mm_token_type_ids", "token_type_ids")
+
+
+@torch.no_grad()
+def emitted_row(model, batch: dict, supports: dict) -> dict[str, torch.Tensor]:
+    """One utterance, scored by grid expectation with every score fed back.
+
+    The transcript stays teacher-forced and only the score tokens are the model's own. That is
+    deliberate: the published protocol fixes the phone sequence, so letting the model write its
+    own phones would misalign a few percent of registers and the phone correlation would stop
+    meaning what the baselines mean. The reinjection is still real, because each emitted score
+    changes what every later token attends to.
+
+    The turn is walked left to right, feeding one segment per trigger — everything up to and
+    including that trigger — and the KV cache carries the rest. That is one forward pass per
+    score rather than per token, and each pass adds only the one to three tokens between two
+    triggers. Scores are read strictly left to right, so each one sits in the context of the
+    scores the model actually emitted, never the gold ones.
+    """
+    device = batch["input_ids"].device
+    ids = batch["input_ids"][0].tolist()
+    read = {key: torch.zeros(len(heads)) for key, heads in batch["heads"].items()}
+    # One event per supervised score slot, in the order the model will meet them.
+    events = sorted(
+        (int(position), key, row)
+        for key, head_batch in batch["heads"].items()
+        for row, (_, position) in enumerate(head_batch.positions.tolist())
+    )
+    if not events:
+        return read
+
+    audio = {k: batch[k] for k in _AUDIO_KEYS if batch.get(k) is not None}
+    cache = None
+    consumed = 0
+    for position, key, row in events:
+        support = supports[key]
+        length = position + 1
+        # The first pass carries the audio; after it the cache holds everything needed, and
+        # re-sending features would scatter them into positions that are already past.
+        first = (
+            {
+                k: (v[:, :length] if k in ("mm_token_type_ids", "token_type_ids") else v)
+                for k, v in audio.items()
+            }
+            if cache is None
+            else {}
+        )
+        outputs = model.base(
+            input_ids=torch.tensor([ids[consumed:length]], device=device),
+            past_key_values=cache,
+            attention_mask=torch.ones(1, length, dtype=torch.long, device=device),
+            cache_position=torch.arange(consumed, length, device=device),
+            use_cache=True,
+            **first,
+        )
+        logits = outputs.logits[:, -1, :]
+        read[key][row] = support.report(logits)[0].float().cpu()
+        # Snap and write back, so the next segment is conditioned on this score.
+        ids[position + 1] = int(support.snap(support.expectation(logits))[0])
+        cache = outputs.past_key_values
+        consumed = position + 1
+    return read
+
+
+@torch.no_grad()
+def score_emitted(
+    model,
+    collator,
+    utterances: list[Utterance],
+    device,
+    bootstrap: bool = True,
+    progress: "Progress | None" = None,
+    interrupt: dict | None = None,
+) -> ScoreResult:
+    """Score a RAIL/RAFT run: the expectation is reported, the token is only its rendering.
+
+    One utterance at a time, unlike the teacher-forced path. Reinjection makes the sequence
+    sequential, so a batch would have to advance in lockstep across utterances whose triggers
+    sit in different places, and padding to the longest would write pad tokens into the cache
+    and change what every later token attends to. Correctness first, and the cache keeps the
+    cost near one forward pass per utterance anyway.
+    """
+    model.eval()
+    supports = grid_supports(collator.grid_ids)
+    collected: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+    scored = 0
+    stopped = False
+
+    for utterance in utterances:
+        batch = move_batch(collator([utterance]), device)
+        read = emitted_row(model, batch, supports)
+        for key, prediction in read.items():
+            # `native`, not `raw`: stress trains and scores on the vote count but reports on
+            # the corpus's published 5-10 median, exactly as the head path does.
+            gold = batch["heads"][key].native.float().cpu()
+            collected.setdefault(key, []).append((prediction.numpy(), gold.numpy()))
+        scored += 1
+        if progress is not None:
+            progress.update(1, detail=memory_note(device))
+        if interrupt is not None and interrupt.get("requested"):
+            stopped = True
+            break
+
+    if not collected:
+        raise SystemExit(
+            "[score] the emitted path found no supervised score slots. Check that the "
+            "collator renders with emit_scores=True and that the split carries labels."
+        )
     predictions = {k: np.concatenate([p for p, _ in v]) for k, v in collected.items()}
     gold = {k: np.concatenate([g for _, g in v]) for k, v in collected.items()}
     metrics = {

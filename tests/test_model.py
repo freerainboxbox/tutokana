@@ -19,8 +19,9 @@ import pytest
 import torch
 
 from tutokana.collate import Collator
+from tutokana.data import FIELD_RANGE
 from tutokana.data import compute_target_stats, phone_vocabulary
-from tutokana.engine import move_batch, preflight, score
+from tutokana.engine import emitted_row, move_batch, preflight, score, score_emitted
 from tutokana.heads import HeadBank, build_head_specs
 from tutokana.losses import CorrelationBuffer, LossConfig, build_reweighter, composite_loss
 from tutokana.model import LORA_TARGET_MODULES, ModelConfig, RegisterDelta, TutokanaModel
@@ -444,3 +445,214 @@ def test_save_and_load_round_trip_preserves_ids(tiny_base, processor, tmp_path):
             other.delta[other.token_ids.index(token_id)],
             delta.delta[delta.token_ids.index(token_id)],
         )
+
+
+# --- the emitted path: read the grid, feed the token back -------------------------------
+
+
+@pytest.fixture
+def emitted(tiny_base, processor, utterances):
+    """The same tiny base with the scores in the text and no regression heads."""
+    from peft import LoraConfig, get_peft_model
+
+    from tutokana.tokens import register_grid_tokens
+
+    sample = utterances[:4]
+    stats = compute_target_stats(sample)
+    phones = phone_vocabulary(sample)
+    spec = TargetSpec(emit_scores=True)
+    tokenizer = processor.tokenizer
+    register_ids = register_tokens(tokenizer)
+    grid_ids = register_grid_tokens(tokenizer)
+    base = get_peft_model(
+        tiny_base,
+        LoraConfig(
+            r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+            task_type="CAUSAL_LM", target_modules=list(LORA_TARGET_MODULES),
+        ),
+    )
+    model = TutokanaModel(
+        base,
+        HeadBank(HIDDEN, {}, spec.levels, n_layers=3),
+        RegisterDelta({**register_ids, **grid_ids}, HIDDEN),
+        ModelConfig(head_layers=3, emitted_delta=True),
+    )
+    collator = Collator(
+        processor, spec, stats, phones, max_length=4096,
+        score_ce=True, grid_ids=grid_ids,
+    )
+    return model, collator, sample
+
+
+def test_emitted_scoring_returns_every_field(emitted, utterances):
+    """Same keys, same gold, same ScoreResult: the reporting side must not notice a change."""
+    model, collator, sample = emitted
+    result = score_emitted(model, collator, sample, CPU, bootstrap=False)
+    assert set(result.metrics) == set(result.predictions)
+    assert result.predictions, "the emitted path produced nothing"
+    for key, prediction in result.predictions.items():
+        assert len(prediction) == len(result.gold[key]), key
+        assert np.isfinite(prediction).all(), key
+
+
+def test_emitted_gold_is_the_collators_native_scale(emitted):
+    """The reported gold must be the published scale, not the grid the model was trained on.
+
+    For stress those two differ (5/10 median against 0-5 votes), and a table that quietly
+    compared a vote-count prediction to a median label would be unreadable rather than wrong.
+    """
+    model, collator, sample = emitted
+    result = score_emitted(model, collator, sample, CPU, bootstrap=False)
+    batch = move_batch(collator(sample), CPU)
+    for key, gold in result.gold.items():
+        assert np.allclose(gold, batch["heads"][key].native.numpy()), key
+    stress = result.gold["word.stress"]
+    assert set(np.unique(stress)) <= {5.0, 10.0}, "stress gold must be the median scale"
+
+
+VOCAB = 1024  # the tiny model's vocab; only the grid columns are read
+
+
+def test_predictions_land_on_the_reported_scale(emitted):
+    """A phone score read off the decimal grid must sit in 0.0-2.0, not in votes."""
+    model, collator, sample = emitted
+    result = score_emitted(model, collator, sample, CPU, bootstrap=False)
+    for key, prediction in result.predictions.items():
+        low, high = FIELD_RANGE[tuple(key.split(".", 1))]
+        assert prediction.min() >= low - 1e-4, (key, prediction.min())
+        assert prediction.max() <= high + 1e-4, (key, prediction.max())
+
+
+def test_reinjection_changes_the_readout(emitted):
+    """The whole point of the loop.
+
+    If feeding the snapped token back did nothing, reading every score from one teacher-forced
+    pass would be equivalent, cheaper, and the model would still be a feature extractor with a
+    regressor bolted on. So: bias one phone score token, and every score read *after* it must
+    move, because the token written back into the stream changed.
+    """
+    from tutokana.rail import grid_supports
+
+    model, collator, sample = emitted
+    batch = move_batch(collator(sample[:1]), CPU)
+    supports = grid_supports(collator.grid_ids)
+    injected = emitted_row(model, batch, supports)
+
+    support = supports["phone.accuracy"]
+    row = model.register_delta.token_ids.index(int(support.token_ids[0]))
+    original = model.register_delta.delta.clone()
+    with torch.no_grad():
+        # A delta of zero is the default here, so *zeroing* a row changes nothing. Push it.
+        model.register_delta.delta[row] = 40.0
+    changed = emitted_row(model, batch, supports)
+    with torch.no_grad():
+        model.register_delta.delta.copy_(original)
+
+    moved = [
+        key for key in injected
+        if not torch.allclose(injected[key], changed[key], atol=1e-5)
+    ]
+    assert moved, "changing a score\'s logits changed no later readout: nothing was reinjected"
+    # The score read before the perturbed one is untouched, which is what "causal" means.
+    assert "utterance.total" in moved, "the last score did not see the reinjected token"
+
+
+def test_emitted_row_is_deterministic(emitted):
+    from tutokana.rail import grid_supports
+
+    model, collator, sample = emitted
+    batch = move_batch(collator(sample[:1]), CPU)
+    supports = grid_supports(collator.grid_ids)
+    first = emitted_row(model, batch, supports)
+    second = emitted_row(model, batch, supports)
+    for key in first:
+        assert torch.allclose(first[key], second[key]), key
+
+
+def test_expectation_is_not_the_sampled_token(emitted):
+    """The reported number is the expectation; the reinjected token is its nearest rendering."""
+    from tutokana.rail import grid_supports
+
+    support = grid_supports(emitted[1].grid_ids)["phone.accuracy"]
+    torch.manual_seed(0)
+    logits = torch.randn(1, VOCAB) * 3.0
+    expectation = support.expectation(logits)
+    snapped = int(support.snap(expectation)[0])
+    assert snapped in support.token_ids.tolist()
+    # A skewed distribution puts the expectation between two grid points, so the token the
+    # loop writes back is a rendering of the number, not the number the metrics report.
+    skewed = torch.full((1, VOCAB), -20.0)
+    for token, value in zip(support.token_ids.tolist(), support.values.tolist()):
+        skewed[0, token] = -abs(value - 1.3)
+    assert float(support.expectation(skewed)) != float(
+        support.values[support.token_ids.tolist().index(int(support.snap(support.expectation(skewed))))]
+    )
+
+
+def test_stress_reports_the_median_scale_not_the_vote_count(emitted):
+    """Grid: 0-5 votes. Reported: the panel's 5/10 median, mapped through P(votes >= 3)."""
+    from tutokana.rail import grid_supports
+
+    supports = grid_supports(emitted[1].grid_ids)
+    support = supports["word.stress"]
+    assert support.values.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+    all_wrong = torch.full((1, VOCAB), -60.0)
+    all_wrong[0, int(support.token_ids[0])] = 20.0
+    assert float(support.report(all_wrong)) == pytest.approx(5.0, abs=1e-4)
+
+    all_right = torch.full((1, VOCAB), -60.0)
+    all_right[0, int(support.token_ids[-1])] = 20.0
+    assert float(support.report(all_right)) == pytest.approx(10.0, abs=1e-4)
+
+    # The expectation, by contrast, is a vote count.
+    assert float(support.expectation(all_wrong)) == pytest.approx(0.0, abs=1e-4)
+    assert float(support.expectation(all_right)) == pytest.approx(5.0, abs=1e-4)
+
+
+def test_probabilities_are_renormalised_onto_the_grid(emitted):
+    """Mass sitting on the rest of the vocabulary is not part of the score."""
+    from tutokana.rail import grid_supports
+
+    supports = grid_supports(emitted[1].grid_ids)
+    support = supports["word.total"]
+    logits = torch.full((1, VOCAB), -60.0)
+    logits[0, support.token_ids.tolist()] = 2.0
+    assert float(support.probabilities(logits).sum()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_preflight_passes_on_the_emitted_path(emitted):
+    """The preflight is the last thing between a flag and thirty hours of nothing."""
+    model, collator, sample = emitted
+    preflight(model, collator, sample[:2], CPU, LossConfig(), None)
+
+
+def test_ce_rail_loss_is_the_text_loss_alone(emitted):
+    """No heads, so the composite objective is cross-entropy on the emitted text."""
+    model, collator, sample = emitted
+    batch = move_batch(collator(sample[:2]), CPU)
+    head_outputs, lm_loss = model(batch)
+    assert head_outputs == {}, "the emitted path must not build heads"
+    total, parts = composite_loss(
+        model.heads, head_outputs, batch["heads"], LossConfig(lambda_lm=0.5), None, None, lm_loss
+    )
+    assert set(parts) == {"loss/lm", "loss/total"}
+    assert float(total.detach()) == pytest.approx(
+        0.5 * float(lm_loss.detach()), rel=1e-5
+    )
+
+
+def test_ce_rail_score_positions_carry_the_gradient(emitted):
+    """If the mask dropped them, the run would train for hours and never learn a score."""
+    model, collator, sample = emitted
+    batch = move_batch(collator(sample[:2]), CPU)
+    grid = torch.tensor(sorted(collator.grid_ids.values()))
+    supervised = torch.isin(batch["input_ids"], grid) & (batch["labels"] != -100)
+    assert int(supervised.sum()) > 0, "no score token is supervised"
+
+    _, lm_loss = model(batch)
+    lm_loss.backward()
+    # The delta rows for the grid are the only trainable thing holding the score tokens'
+    # output embeddings, so they must be the ones moving.
+    assert model.register_delta.delta.grad is not None
+    assert float(model.register_delta.delta.grad.abs().sum()) > 0.0

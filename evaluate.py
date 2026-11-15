@@ -213,6 +213,13 @@ def main() -> None:
             grid_ids=grid_ids,
         )
         with graceful_interrupt() as interrupt:
+            if config.emits_scores:
+                # Reinjection makes the turn sequential, so there is no batch to size.
+                log.info(
+                    "[score] %s: one utterance per pass, transcript teacher-forced, "
+                    "every score emitted and fed back",
+                    config.variant,
+                )
             with Progress(len(utterances), log, "score", every=10, unit="utt") as bar:
                 result = score(
                     model, collator, utterances, device,
@@ -229,6 +236,10 @@ def main() -> None:
             )
 
         title = f"{run_id} / {args.split}"
+        if config.emits_scores:
+            # The Results table is teacher-forced. A variant feeds its own emitted scores
+            # back, so the two are not the same measurement and must not share a title.
+            title += f" [{config.variant}: self-reinjected]"
         if result.partial:
             title += f" (PARTIAL: {result.scored}/{len(utterances)})"
         table = render_table(result.metrics, title=title, lite=args.lite)
