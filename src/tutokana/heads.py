@@ -379,12 +379,16 @@ class HeadBank(nn.Module):
         """{head key: raw head output} for every populated head in the batch.
 
         Two passes: heads that read a sibling's output run after the heads they read.
+
+        A key the bank does not hold is skipped, not an error. Under a RAIL/RAFT variant the
+        collator still emits per-field positions and gold, because the emitted-score path needs
+        both to score and to take its loss, while the bank itself is deliberately empty.
         """
         pooled: dict[str, torch.Tensor] = {}
         outputs: dict[str, torch.Tensor] = {}
         deferred: list[tuple[str, object, torch.Tensor]] = []
         for key, batch in heads.items():
-            if len(batch) == 0:
+            if len(batch) == 0 or key.replace(".", "__") not in self.heads:
                 continue
             level = key.split(".", 1)[0]
             if level not in pooled:

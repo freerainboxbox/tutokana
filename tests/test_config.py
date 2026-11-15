@@ -134,8 +134,16 @@ def test_the_refusal_says_what_is_still_missing():
         Config(variant="raft_rail").require_implemented()
     message = str(excinfo.value)
     assert "RAFT loss" in message
-    assert "LM-CE mask" in message
-    assert "grid token" in message
+    assert "decode loop" in message
+
+
+def test_ce_rail_is_only_missing_the_decode_loop():
+    """The mask and the emitted tokens exist, so only inference is left in this arm."""
+    with pytest.raises(SystemExit) as excinfo:
+        Config(variant="ce_rail").require_implemented()
+    message = str(excinfo.value)
+    assert "decode loop" in message
+    assert "RAFT loss" not in message
 
 
 def test_the_refusal_offers_the_command_that_works():

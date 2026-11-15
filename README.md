@@ -46,6 +46,16 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 - A score token occupies an unused slot whose base row carries no numeric meaning. So the delta seeds from the digits the token stands for, and the row for `1.0` becomes the mean of `1`, `.` and `0`. The seed subtracts the slot's own base row, because the delta is added to it. Registers keep a zero init. A field name has no textual meaning to inherit.
 - Delta rows are checkpointed **by vocabulary id**, alongside a persisted id list. `load_state_dict` raises on a size mismatch even with `strict=False`, and the row count goes from 11 to 33 the moment the grid tokens join. So `merge_state` copies rows by id instead. Rows the file does not cover keep their seed. That is what lets a variant warm-start from a regression-head checkpoint.
 
+**Emitted scores and the loss mask**
+
+- `TargetSpec.emit_scores` turns the register into a trigger. `render_target` then writes one grid token after every score register, so the score is in the text and later tokens attend to it. The renderer takes a grid-string to token map, because a score never reaches the text as digits: `1.8` is three tokens and sits off the grid.
+- `prompting.slot_value` is the single definition of what a slot carries. The renderer reads it to pick the token, and the collator reads it to build the head target. Two copies would let the token and the head target disagree, and no test would notice.
+- The mask treats a trigger and a score differently, and that is the whole point. A register is always masked: under the head path the model never emits one, and under a variant a trigger is punctuation fixed by the transcript. A score token is the prediction, so `Collator.score_ce` decides who supervises it.
+- `score_ce=True` is `--ce-rail`. Cross-entropy reaches the token. `score_ce=False` is `--raft-rail`. There the token is only a rendering of the expectation, so leaving it in the mask would re-add the mode-seeking term that arm exists to remove.
+- A slot with no label emits **no token at all**. The synthetic negatives pair a transcript with unrelated audio, so their words have no stress pattern to judge. Inventing a score to keep the shape uniform would put a made-up number in the context of every later token. The register stays, the next register follows it, and nothing at that position is supervised.
+- A variant builds no regression heads. The scores are in the text, so a head on the same field would be a second channel in one run. The arm would then not be the one documented under **Variants**. The collator still emits per-field positions and gold, because scoring and the RAFT loss both need them, so `HeadBank.read` skips keys the bank does not hold. With an empty bank the forward pass also stops requesting hidden states, which is the largest activation in the pass.
+- Both arms emit byte-identical text. They differ only in the mask, so a difference in results cannot come from the data.
+
 **Ordering**
 
 - The model uses one unified turn: phones → word registers → utterance registers. It uses causal masking from the bottom up. Word registers see their phones, and utterance registers see all previous data.

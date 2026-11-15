@@ -48,7 +48,7 @@ from tutokana.reporting import (
     render_table,
     render_transcription,
 )
-from tutokana.tokens import register_tokens
+from tutokana.tokens import register_grid_tokens, register_tokens
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,19 +154,27 @@ def main() -> None:
         stats = TargetStats.load(run_dir / "target_stats.json")
         phones = tuple(meta["phones"])
         spec = TargetSpec(
-            levels=tuple(config.data.levels), emit_phones=config.data.emit_phones
+            levels=tuple(config.data.levels),
+            emit_phones=config.data.emit_phones,
+            emit_scores=config.emits_scores,
         )
 
         processor = load_processor(config.model_id)
-        register_ids = register_tokens(getattr(processor, "tokenizer", processor))
-        head_specs = build_head_specs(
-            levels=spec.levels,
-            head_modes=config.head_modes.as_dict(),
-            n_phone_conditions=len(phones) + 1,
-            phone_conditioning=config.phone_conditioning,
-            stats=stats,
-            stress_concentration=config.stress_concentration,
-            stress_siblings=config.stress_siblings,
+        tokenizer = getattr(processor, "tokenizer", processor)
+        register_ids = register_tokens(tokenizer)
+        grid_ids = register_grid_tokens(tokenizer) if config.emits_scores else None
+        head_specs = (
+            {}
+            if config.emits_scores
+            else build_head_specs(
+                levels=spec.levels,
+                head_modes=config.head_modes.as_dict(),
+                n_phone_conditions=len(phones) + 1,
+                phone_conditioning=config.phone_conditioning,
+                stats=stats,
+                stress_concentration=config.stress_concentration,
+                stress_siblings=config.stress_siblings,
+            )
         )
         # The untuned floor: the same wiring and the same target statistics, but random
         # heads over the stock model. Whatever it scores is what the architecture gets for
@@ -185,6 +193,8 @@ def main() -> None:
             register_ids=register_ids,
             device=device,
             adapter_dir=None if untuned else run_dir / "adapter",
+            grid_ids=grid_ids,
+            tokenizer=tokenizer,
         )
         if untuned:
             run_id = f"{run_id}-UNTUNED"
@@ -194,7 +204,13 @@ def main() -> None:
             log.info("[model] loaded adapter and heads from %s", run_dir)
 
         collator = Collator(
-            processor, spec, stats, phones, max_length=config.data.max_length
+            processor,
+            spec,
+            stats,
+            phones,
+            max_length=config.data.max_length,
+            score_ce=config.variant == "ce_rail",
+            grid_ids=grid_ids,
         )
         with graceful_interrupt() as interrupt:
             with Progress(len(utterances), log, "score", every=10, unit="utt") as bar:
@@ -275,6 +291,7 @@ def main() -> None:
             decode_collator = Collator(
                 processor, spec, stats, phones,
                 max_length=config.data.max_length, with_target=False,
+                grid_ids=grid_ids,
             )
             predicted, gold = generative_pass(
                 model, processor, decode_collator, subset, device, args.max_new_tokens

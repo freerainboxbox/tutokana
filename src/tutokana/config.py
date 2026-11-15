@@ -38,15 +38,13 @@ VARIANTS = ("heads", "ce_rail", "raft_rail")
 #: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
 NOT_IMPLEMENTED = {
     "ce_rail": (
-        "the LM-CE mask (collate._language_labels masks every register, so the score token "
-        "gets no cross-entropy)",
-        "the decode loop that snaps the expectation to a grid token and feeds it back",
+        "the decode loop that takes the expectation over the grid, snaps it to the nearest "
+        "grid token and feeds that token back",
     ),
     "raft_rail": (
         "the RAFT loss in losses.py (squared error of the grid expectation)",
-        "the LM-CE mask (collate._language_labels masks every register, so the score token "
-        "gets no cross-entropy)",
-        "the decode loop that snaps the expectation to a grid token and feeds it back",
+        "the decode loop that takes the expectation over the grid, snaps it to the nearest "
+        "grid token and feeds that token back",
     ),
 }
 

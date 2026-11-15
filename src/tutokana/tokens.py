@@ -272,6 +272,16 @@ def grid_for(level: str, field: str) -> ScoreGrid:
         ) from None
 
 
+def grid_token_map(tokenizer, grid_ids: dict[str, int]) -> dict[str, str]:
+    """{grid string: the literal token that carries it}, for writing a score into text.
+
+    A score never reaches the text as digits. `1.0` is one registered `<unusedN>` token, and
+    writing the literal `1.0` would tokenize to three tokens and put the score outside the
+    support the expectation is taken over. So the renderer needs this map, not the ids.
+    """
+    return {text: tokenizer.convert_ids_to_tokens(tid) for text, tid in grid_ids.items()}
+
+
 def slots_for(tokenizer, count: int, taken: set[str]) -> list[str]:
     """The `count` lowest unused Gemma slots, as `<unusedN>` strings.
 

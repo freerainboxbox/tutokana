@@ -250,6 +250,10 @@ class TutokanaModel(nn.Module):
         eval pass measured in minutes and one measured in hours.
         """
         input_ids = batch["input_ids"]
+        # A RAIL/RAFT run has an empty head bank, and asking for every layer's hidden state is
+        # the single largest activation in the pass: 49 tensors of (batch, sequence, hidden).
+        # Nothing would read them, so do not materialise them.
+        reads_heads = len(self.heads.heads) > 0
         model_kwargs = {
             key: value
             for key, value in batch.items()
@@ -266,11 +270,15 @@ class TutokanaModel(nn.Module):
         outputs = self.base(
             input_ids=input_ids,
             labels=batch.get("labels") if with_lm_loss else None,
-            output_hidden_states=True,
+            output_hidden_states=reads_heads,
             use_cache=False,
             **model_kwargs,
         )
-        head_outputs = self.heads.read(outputs.hidden_states, batch.get("heads", {}))
+        head_outputs = (
+            self.heads.read(outputs.hidden_states, batch.get("heads", {}))
+            if reads_heads
+            else {}
+        )
         return head_outputs, getattr(outputs, "loss", None)
 
     def trainable_parameters(self) -> tuple[int, int]:
@@ -405,7 +413,9 @@ def build_model(
     head_bank = HeadBank(
         hidden_size=hidden_size,
         specs=head_specs,
-        levels=levels,
+        # No specs means no heads, and a layer mixture with nothing downstream of it would
+        # still land in the optimizer as a trainable parameter that can never receive gradient.
+        levels=tuple(levels) if head_specs else (),
         n_layers=head_layers,
         proj_size=config.head_proj_size,
         dropout=config.head_dropout,

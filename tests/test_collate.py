@@ -15,6 +15,7 @@ import torch
 from tutokana.collate import IGNORE_INDEX, Collator, head_key
 from tutokana.data import compute_target_stats, phone_vocabulary
 from tutokana.prompting import TargetSpec
+from tutokana.tokens import GRID_STRINGS
 
 AUDIO_TOKENS_PER_SAMPLE = 4
 
@@ -265,3 +266,128 @@ def test_a_batch_of_only_negatives_has_no_stress_batch(collator, utterances):
     batch = collator([negative])
     assert head_key("word", "stress") not in batch["heads"]
     assert len(batch["heads"][head_key("word", "accuracy")]) == len(negative.words)
+
+
+# --- emitted scores: the register is a trigger, the score token is the prediction -------
+
+
+def _emitted_collator(tokenizer, utterances, score_ce: bool):
+    from tutokana.tokens import register_grid_tokens, register_tokens
+
+    register_tokens(tokenizer)
+    grid_ids = register_grid_tokens(tokenizer)
+    tokenizer.padding_side = "right"
+    return Collator(
+        StubProcessor(tokenizer),
+        TargetSpec(emit_scores=True),
+        compute_target_stats(utterances),
+        phone_vocabulary(utterances),
+        max_length=4096,
+        score_ce=score_ce,
+        grid_ids=grid_ids,
+    )
+
+
+@pytest.fixture
+def ce_collator(tokenizer, utterances):
+    return _emitted_collator(tokenizer, utterances, score_ce=True)
+
+
+@pytest.fixture
+def raft_collator(tokenizer, utterances):
+    return _emitted_collator(tokenizer, utterances, score_ce=False)
+
+
+def test_emitting_scores_registers_the_grid(ce_collator):
+    assert len(ce_collator.grid_ids) == len(GRID_STRINGS) == 22
+    # The renderer writes tokens, not ids, and never the digits themselves.
+    assert set(ce_collator.grid_tokens) == set(ce_collator.grid_ids)
+    assert all(t.startswith("<unused") for t in ce_collator.grid_tokens.values())
+
+
+def test_the_trigger_stays_masked_under_both_arms(ce_collator, raft_collator, utterances):
+    """A trigger is punctuation. The model is scored on the token it puts after it."""
+    for collator in (ce_collator, raft_collator):
+        batch = collator(utterances[:2])
+        registers = torch.tensor(sorted(collator.register_ids.values()))
+        assert (batch["labels"][torch.isin(batch["input_ids"], registers)] == IGNORE_INDEX).all()
+
+
+def test_ce_rail_supervises_the_score_token(ce_collator, utterances):
+    """The emitted token is the prediction, so cross-entropy has to reach it."""
+    batch = ce_collator(utterances[:2])
+    grid = torch.tensor(sorted(ce_collator.grid_ids.values()))
+    on_grid = torch.isin(batch["input_ids"], grid)
+    assert on_grid.any(), "the target text emitted no score tokens"
+    assert (batch["labels"][on_grid] != IGNORE_INDEX).all()
+
+
+def test_raft_rail_masks_the_score_token(raft_collator, utterances):
+    """Leaving it in the CE mask would re-add the mode-seeking term this arm removes."""
+    batch = raft_collator(utterances[:2])
+    grid = torch.tensor(sorted(raft_collator.grid_ids.values()))
+    on_grid = torch.isin(batch["input_ids"], grid)
+    assert on_grid.any()
+    assert (batch["labels"][on_grid] == IGNORE_INDEX).all()
+
+
+def test_the_transcript_is_still_supervised_under_raft(raft_collator, utterances):
+    """Masking the scores must not mask the whole completion."""
+    batch = raft_collator(utterances[:2])
+    assert (batch["labels"] != IGNORE_INDEX).sum() > 0
+
+
+def test_both_arms_emit_the_same_text(ce_collator, raft_collator, utterances):
+    """The arms differ in the loss, never in the data. A text difference would confound."""
+    assert torch.equal(ce_collator(utterances[:2])["input_ids"],
+                       raft_collator(utterances[:2])["input_ids"])
+
+
+def test_emitting_scores_leaves_the_gold_supervision_alone(ce_collator, collator, utterances):
+    """Gold, fields and counts are shared, so the emitted arm is measured like the rest.
+
+    Positions cannot match: the emitted text is longer, so every register sits further along
+    the row. What must match is which slot carries which number.
+    """
+    emitted, plain = ce_collator(utterances[:3]), collator(utterances[:3])
+    assert set(emitted["heads"]) == set(plain["heads"])
+    for key in plain["heads"]:
+        assert len(emitted["heads"][key]) == len(plain["heads"][key]), key
+        assert torch.equal(emitted["heads"][key].raw, plain["heads"][key].raw), key
+        assert torch.equal(emitted["heads"][key].native, plain["heads"][key].native), key
+
+
+def test_the_score_token_sits_next_to_its_trigger(ce_collator, utterances):
+    """The expectation is read at the trigger, so the token must be the very next id."""
+    batch = ce_collator(utterances[:3])
+    ids = batch["input_ids"]
+    grid = set(ce_collator.grid_ids.values())
+    checked = 0
+    for key, head_batch in batch["heads"].items():
+        for b, position in head_batch.positions.tolist():
+            assert int(ids[b, position + 1]) in grid, (
+                f"{key}: position {position} is a trigger but its successor is not a score"
+            )
+            checked += 1
+    assert checked > 0
+
+
+def test_unrated_stress_emits_no_token_and_supervises_nothing(tokenizer, utterances):
+    """No gradient there, and no invented number in the context every later token reads."""
+    from dataclasses import replace
+
+    negatives = [
+        replace(u, words=(replace(u.words[0], stress=None, stress_votes=None),) + u.words[1:])
+        for u in utterances
+    ]
+    grid_collator = _emitted_collator(tokenizer, negatives, score_ce=True)
+    emitted = grid_collator(negatives[:2])
+    rated = _emitted_collator(tokenizer, utterances, score_ce=True)(utterances[:2])
+
+    grid = torch.tensor(sorted(grid_collator.grid_ids.values()))
+    assert int(torch.isin(emitted["input_ids"], grid).sum()) == (
+        int(torch.isin(rated["input_ids"], grid).sum()) - 2
+    ), "one score token fewer per row, not some other difference"
+
+    stress = emitted["heads"][head_key("word", "stress")]
+    assert len(stress) == len(rated["heads"][head_key("word", "stress")]) - 2

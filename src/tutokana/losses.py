@@ -301,6 +301,11 @@ def composite_loss(
     log line without dragging the graph along.
     """
     device = next(iter(head_outputs.values())).device if head_outputs else None
+    if device is None and lm_loss is not None:
+        # A RAIL/RAFT run has no heads, so the text loss is the only thing that knows which
+        # accelerator the batch is on. Starting the total on the CPU would make the first
+        # `total + lambda * lm_loss` cross devices.
+        device = lm_loss.device
     total = torch.zeros((), device=device) if device is not None else torch.zeros(())
     parts: dict[str, float] = {}
 

@@ -71,7 +71,7 @@ from tutokana.model import (
 from tutokana.prompting import TargetSpec
 from tutokana.progress import Progress, memory_note
 from tutokana.reporting import wandb_metrics
-from tutokana.tokens import register_tokens
+from tutokana.tokens import register_grid_tokens, register_tokens
 
 
 def parse_args() -> tuple[argparse.Namespace, set[str]]:
@@ -182,19 +182,38 @@ def main() -> None:
             log.info("[mix] probe mode: %d samples", len(mix))
 
         # -- model --------------------------------------------------------------------
-        spec = TargetSpec(levels=tuple(config.data.levels), emit_phones=config.data.emit_phones)
-        processor = load_processor(config.model_id)
-        register_ids = register_tokens(getattr(processor, "tokenizer", processor))
-        head_specs = build_head_specs(
-            levels=spec.levels,
-            head_modes=config.head_modes.as_dict(),
-            n_phone_conditions=len(phones) + 1,
-            phone_conditioning=config.phone_conditioning,
-            stats=stats,
-            stress_concentration=config.stress_concentration,
-            stress_siblings=config.stress_siblings,
+        spec = TargetSpec(
+            levels=tuple(config.data.levels),
+            emit_phones=config.data.emit_phones,
+            emit_scores=config.emits_scores,
         )
-        log.info("[model] heads %s", sorted(head_specs))
+        processor = load_processor(config.model_id)
+        tokenizer = getattr(processor, "tokenizer", processor)
+        register_ids = register_tokens(tokenizer)
+        # Registered once here and handed to the collator: under a variant the delta needs the
+        # grid rows, and registering twice would only make the id source ambiguous.
+        grid_ids = register_grid_tokens(tokenizer) if config.emits_scores else None
+        # A variant replaces the output channel rather than adding to it. With the scores in
+        # the text, a head reading the same field would be a second channel in the same run,
+        # and the arm would no longer be the one the README describes.
+        head_specs = (
+            {}
+            if config.emits_scores
+            else build_head_specs(
+                levels=spec.levels,
+                head_modes=config.head_modes.as_dict(),
+                n_phone_conditions=len(phones) + 1,
+                phone_conditioning=config.phone_conditioning,
+                stats=stats,
+                stress_concentration=config.stress_concentration,
+                stress_siblings=config.stress_siblings,
+            )
+        )
+        log.info(
+            "[model] %s",
+            "emitted scores: no regression heads" if config.emits_scores
+            else f"heads {sorted(head_specs)}",
+        )
 
         model = build_model(
             ModelConfig(
@@ -213,6 +232,8 @@ def main() -> None:
             device=device,
             adapter_dir=(run_dir / "adapter") if resume_meta is not None else None,
             trainable_adapter=resume_meta is not None,
+            grid_ids=grid_ids,
+            tokenizer=tokenizer,
         )
         if resume_meta is not None:
             model.load_trained(run_dir)
@@ -221,7 +242,13 @@ def main() -> None:
                  trainable / 1e6, total / 1e6, 100 * trainable / total)
 
         collator = Collator(
-            processor, spec, stats, phones, max_length=config.data.max_length
+            processor,
+            spec,
+            stats,
+            phones,
+            max_length=config.data.max_length,
+            score_ce=config.variant == "ce_rail",
+            grid_ids=grid_ids,
         )
 
         loss_config = LossConfig(

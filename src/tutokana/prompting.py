@@ -24,6 +24,7 @@ from .tokens import (
     TASK,
     UTTERANCE_REGISTERS,
     WORD_REGISTERS,
+    grid_for,
 )
 
 #: Short by design: the register layout *is* the output format, so no format specification
@@ -51,6 +52,10 @@ class TargetSpec:
 
     levels: tuple[str, ...] = LEVELS
     emit_phones: bool = True
+    #: Under a RAIL/RAFT variant the score is text: one grid token follows every score
+    #: register. Off keeps the regression-head turn, where a register is the end of the field
+    #: and the score lives only in a head readout.
+    emit_scores: bool = False
 
     def __post_init__(self) -> None:
         unknown = set(self.levels) - set(LEVELS)
@@ -85,6 +90,30 @@ class RenderedTarget:
     slots: tuple[RegisterSlot, ...] = ()
 
 
+def slot_value(utterance: Utterance, slot: RegisterSlot) -> float | None:
+    """The label one slot carries, on the scale its own grid is built from.
+
+    This is the single definition both channels read: the renderer turns it into a grid token,
+    and the collator turns it into a head target. If they each had their own copy, the token
+    in the text and the number in the head could disagree without any test noticing.
+
+    `word.stress` is the annotator vote count, not the released 5/10 median, because the stress
+    grid is the vote grid.
+
+    None means the slot is emitted but unsupervised. Only word stress can be: the synthetic
+    negatives in the mix pair a transcript with unrelated audio, so their words have no stress
+    pattern to judge.
+    """
+    if slot.level == "utterance":
+        return utterance.utterance_targets()[slot.field]
+    word = utterance.words[slot.word]
+    if slot.level == "word":
+        if slot.field == "stress":
+            return None if word.stress_votes is None else float(word.stress_votes)
+        return getattr(word, slot.field)
+    return word.phone_accuracy[slot.phone]
+
+
 def render_prompt(processor, transcript: str) -> str:
     """The exact prefix generation starts from — the single source both sides read.
 
@@ -104,13 +133,42 @@ def render_prompt(processor, transcript: str) -> str:
     )
 
 
-def render_target(utterance: Utterance, spec: TargetSpec, eos: str = "<turn|>") -> RenderedTarget:
-    """The supervised assistant turn plus the register layout it implies."""
+def render_target(
+    utterance: Utterance,
+    spec: TargetSpec,
+    eos: str = "<turn|>",
+    grid_tokens: dict[str, str] | None = None,
+) -> RenderedTarget:
+    """The supervised assistant turn plus the register layout it implies.
+
+    With `spec.emit_scores`, every score register is followed by the one grid token naming its
+    value, and `grid_tokens` (grid string -> registered token) is required. A slot with no
+    label gets no token at all: the trigger is still there, but the next thing after it is the
+    next register, and nothing at that position is supervised. Inventing a score to keep the
+    shape uniform would put a made-up number in the context every later token attends to.
+    """
+    if spec.emit_scores and grid_tokens is None:
+        raise ValueError(
+            "emit_scores needs grid_tokens: a score is emitted as one registered token, so "
+            "the renderer cannot write the digits itself. Build the map with "
+            "tokens.grid_token_map(tokenizer, register_grid_tokens(tokenizer))."
+        )
     parts: list[str] = [TASK.token, "\n"]
     slots: list[RegisterSlot] = []
     want_phone = "phone" in spec.levels
     want_word = "word" in spec.levels
     want_utterance = "utterance" in spec.levels
+
+    def emit(reg, word_idx=None, phone_idx=None) -> None:
+        """Append one register, and under emit_scores the grid token naming its value."""
+        parts.append(reg.token)
+        slot = RegisterSlot(reg.name, reg.level, reg.field, word_idx, phone_idx)
+        if spec.emit_scores:
+            value = slot_value(utterance, slot)
+            if value is not None:
+                grid = grid_for(slot.level, slot.field)
+                parts.append(grid_tokens[grid.render(value)])
+        slots.append(slot)
 
     for w_idx, word in enumerate(utterance.words):
         parts.append(word.text)
@@ -122,29 +180,29 @@ def render_target(utterance: Utterance, spec: TargetSpec, eos: str = "<turn|>") 
                 parts.append(phone)
                 if want_phone:
                     for reg in PHONE_REGISTERS:
-                        parts.append(reg.token)
-                        slots.append(
-                            RegisterSlot(reg.name, reg.level, reg.field, w_idx, p_idx)
-                        )
+                        emit(reg, w_idx, p_idx)
         if want_word:
             parts.append(SEP_WORD.token)
             for reg in WORD_REGISTERS:
-                parts.append(reg.token)
-                slots.append(RegisterSlot(reg.name, reg.level, reg.field, w_idx, None))
+                emit(reg, w_idx, None)
         parts.append("\n")
 
     if want_utterance:
         for reg in UTTERANCE_REGISTERS:
-            parts.append(reg.token)
-            slots.append(RegisterSlot(reg.name, reg.level, reg.field, None, None))
+            emit(reg, None, None)
 
     parts.append(eos)
     return RenderedTarget(text="".join(parts), slots=tuple(slots))
 
 
-def render_training_text(processor, utterance: Utterance, spec: TargetSpec) -> RenderedTarget:
+def render_training_text(
+    processor,
+    utterance: Utterance,
+    spec: TargetSpec,
+    grid_tokens: dict[str, str] | None = None,
+) -> RenderedTarget:
     """Eval prompt + supervised target. Nothing else may build training text."""
-    rendered = render_target(utterance, spec)
+    rendered = render_target(utterance, spec, grid_tokens=grid_tokens)
     return RenderedTarget(
         text=render_prompt(processor, utterance.text) + rendered.text,
         slots=rendered.slots,

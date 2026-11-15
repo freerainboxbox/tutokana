@@ -17,8 +17,14 @@ import numpy as np
 import torch
 
 from .data import SAMPLE_RATE, TargetStats, Utterance
-from .prompting import TargetSpec, render_prompt, render_target
-from .tokens import UNTRAINED_FIELDS, register_tokens
+from .prompting import (
+    RegisterSlot,
+    TargetSpec,
+    render_prompt,
+    render_target,
+    slot_value,
+)
+from .tokens import UNTRAINED_FIELDS, grid_token_map, register_grid_tokens, register_tokens
 
 IGNORE_INDEX = -100
 #: `<channel|>` — closes the empty thought block the chat template appends, and therefore
@@ -83,18 +89,40 @@ class Collator:
         phone_vocab: tuple[str, ...],
         max_length: int | None = 2048,
         with_target: bool = True,
+        score_ce: bool = True,
+        grid_ids: dict[str, int] | None = None,
     ):
+        """`score_ce` decides whether an emitted score token is trained by cross-entropy.
+
+        True is `--ce-rail`: the token in the text is the thing the model is optimised to put
+        there. False is `--raft-rail`: the token is only a rendering of the grid expectation,
+        and the expectation is what the loss supervises, so leaving the token in the CE mask
+        would train the mode-seeking objective the arm exists to avoid.
+        """
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", processor)
         self.spec = spec
         self.stats = stats
         self.max_length = max_length
+        self.score_ce = score_ce
         # The scored evaluation also renders the target — it teacher-forces the canonical
         # phones so registers align one-to-one with gold. Only the generative-mode decode
         # sets with_target=False.
         self.with_target = with_target
         self.register_ids = register_tokens(self.tokenizer)
         self.id_to_register = {v: k for k, v in self.register_ids.items()}
+        #: Under a RAIL/RAFT variant the score is one registered token, so the renderer needs
+        #: the grid string -> token map and the mask needs the id set.
+        self.grid_ids: dict[str, int] = {}
+        self.grid_tokens: dict[str, str] = {}
+        if spec.emit_scores:
+            # Registration is idempotent, so a caller that already registered (the trainer
+            # needs the ids for the delta seed) can hand them over instead of paying twice.
+            self.grid_ids = (
+                grid_ids if grid_ids is not None
+                else register_grid_tokens(self.tokenizer)
+            )
+            self.grid_tokens = grid_token_map(self.tokenizer, self.grid_ids)
         self.phone_to_id = {p: i + 1 for i, p in enumerate(phone_vocab)}
         self.n_phone_ids = len(phone_vocab) + 1
         eoc = self.tokenizer.encode(END_OF_CHANNEL_TOKEN, add_special_tokens=False)
@@ -116,25 +144,20 @@ class Collator:
     def _raw_value(self, utterance: Utterance, slot) -> float:
         """The label the head's pointwise loss reads.
 
-        Identical to the reported label everywhere except word stress, where the released
-        5/10 score is the median of five annotators and the head is trained on how many of
-        them agreed. Reporting is unaffected: the head maps its prediction back onto the
-        published median scale.
+        Delegates to `prompting.slot_value`, the same function the renderer uses to pick the
+        emitted grid token, so the token in the text and the target in the head cannot drift.
         """
-        if (slot.level, slot.field) == ("word", "stress"):
-            return float(utterance.words[slot.word].stress_votes)
-        return self._native_value(utterance, slot)
+        return slot_value(utterance, slot)
 
-    def _has_target(self, utterance: Utterance, slot) -> bool:
+    def _has_target(self, utterance: Utterance, slot: RegisterSlot) -> bool:
         """False for a register that is emitted but unsupervised.
 
         Only word stress can be unrated (the synthetic negatives). The register still appears
         in the text so the assistant turn keeps one shape, but the head gets no row for it:
-        an unrated word must contribute no gradient, not a made-up label.
+        an unrated word must contribute no gradient, not a made-up label. Under a RAIL/RAFT
+        variant the renderer applies the same rule, so it emits no score token there either.
         """
-        if (slot.level, slot.field) == ("word", "stress"):
-            return utterance.words[slot.word].stress_rated
-        return True
+        return slot_value(utterance, slot) is not None
 
     def _phone_id(self, utterance: Utterance, slot) -> int:
         return self.phone_to_id.get(utterance.words[slot.word].phones[slot.phone], 0)
@@ -142,7 +165,9 @@ class Collator:
     # -- batching --------------------------------------------------------------------
 
     def __call__(self, utterances: list[Utterance]) -> dict:
-        rendered = [render_target(u, self.spec) for u in utterances]
+        rendered = [
+            render_target(u, self.spec, grid_tokens=self.grid_tokens) for u in utterances
+        ]
         texts = [
             render_prompt(self.processor, u.text) + (r.text if self.with_target else "")
             for u, r in zip(utterances, rendered)
@@ -186,11 +211,24 @@ class Collator:
         return out
 
     def _language_labels(self, input_ids: torch.Tensor, attention_mask) -> torch.Tensor:
-        """Cross-entropy targets over the completion text only."""
+        """Cross-entropy targets over the completion text only.
+
+        A register is always masked. Under the regression-head path that is because the model
+        never has to produce one; under a RAIL/RAFT variant it is because a trigger is
+        punctuation, not a prediction — the model is scored on the score token it puts after
+        it, and training it to emit the trigger would spend the loss on a token that is fully
+        determined by the transcript.
+
+        An emitted score token is the opposite case: it is the prediction. `score_ce` decides
+        whether cross-entropy supervises it (`--ce-rail`) or whether the grid expectation does
+        (`--raft-rail`, where leaving it here would re-add the mode-seeking term the arm
+        removes).
+        """
         labels = input_ids.clone()
-        register_id_tensor = torch.tensor(
-            sorted(self.register_ids.values()), dtype=input_ids.dtype
-        )
+        masked = sorted(self.register_ids.values())
+        if self.spec.emit_scores and not self.score_ce:
+            masked = masked + sorted(self.grid_ids.values())
+        register_id_tensor = torch.tensor(masked, dtype=input_ids.dtype)
         for b in range(input_ids.shape[0]):
             boundary = (input_ids[b] == self.end_of_channel_id).nonzero(as_tuple=True)[0]
             if boundary.numel() != 1:
