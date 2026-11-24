@@ -1,14 +1,17 @@
 """Run a multi-seed, multi-mode training and evaluation batch study in serial.
 
-Trains and evaluates each active mode (`heads`, `ce-std`, `ce-rail`, `raft-rail`) across every
-given seed in round-robin order:
+Evaluates each active mode (`heads`, `ce-std`, `ce-rail`, `raft-rail`) across every given seed
+in round-robin order. `ce-std` and `ce-rail` share a training objective, so they are both
+evaluated from one `ce` training run; the training runs per round are `heads`, `ce`, `raft-rail`:
 
     python batch_study.py --prefix alpha --seeds 42,43,44,45,46
     python batch_study.py --prefix alpha --seeds 42,43 --no-ce-std
     python batch_study.py --resume --prefix alpha
     python batch_study.py --purge --prefix alpha
 
-Each run is named `<prefix>_<mode>_<round>_<seed>` (1-based round, e.g. `alpha_raft-rail_1_42`).
+Each training run is named `<prefix>_<train-mode>_<round>_<seed>` (1-based round, e.g.
+`alpha_ce_1_42`), and each evaluation result `results/<prefix>_<mode>_<round>_<seed>.csv`
+(e.g. `alpha_ce-rail_1_42.csv`).
 Standard train/eval logs still write to `logs/` unchanged; every other study artifact — model
 weights, checkpoints, per-run CSVs/JSONs, study resume metadata, and final Fisher-Z summaries —
 is collected under `batch-studies/<prefix>/`.
@@ -37,6 +40,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from tutokana import config as cfg
 from tutokana.engine import RESUME_META
 from tutokana.study import (
+    EVAL_VARIANT,
     MODE_TO_FLAG,
     MODES,
     STUDY_STATE_FILE,
@@ -45,6 +49,7 @@ from tutokana.study import (
     new_study_state,
     parse_seeds,
     resolve_modes,
+    make_run_id,
     save_study_state,
     validate_prefix,
     write_study_summaries,
@@ -72,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefix",
         default="",
-        help="required batch study prefix; run IDs are <prefix>_<mode>_<round>_<seed>",
+        help="required batch study prefix; run IDs are <prefix>_<train-mode>_<round>_<seed>",
     )
     parser.add_argument(
         "--seeds",
@@ -274,6 +279,7 @@ def _eval_command(
     csv_path: Path,
     json_path: Path,
     state: dict,
+    eval_mode: str,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -295,6 +301,8 @@ def _eval_command(
         cmd.append("--no-bootstrap")
     if state.get("snap"):
         cmd.append("--snap")
+    if eval_mode in EVAL_VARIANT:
+        cmd.extend(["--eval-variant", EVAL_VARIANT[eval_mode]])
     return cmd
 
 
@@ -476,8 +484,8 @@ def run_batch_study(
         )
         save_study_state(study_dir, state)
         print(
-            f"[batch] starting study {prefix!r}: {len(state['runs'])} runs "
-            f"({len(modes)} modes x {len(seeds)} seeds) -> {study_dir}",
+            f"[batch] starting study {prefix!r}: {len(state['runs'])} training runs "
+            f"for {len(modes)} modes x {len(seeds)} seeds -> {study_dir}",
             flush=True,
         )
 
@@ -497,13 +505,20 @@ def run_batch_study(
         seed = int(entry["seed"])
         round_num = int(entry["round"])
         run_dir = runs_root / run_id
-        csv_path = results_root / f"{run_id}.csv"
-        json_path = results_root / f"{run_id}.json"
+        evals = entry["evals"]
 
-        if entry["status"] == "completed" and csv_path.exists():
+        def result_paths(ev: dict) -> tuple[Path, Path]:
+            eval_id = make_run_id(state["prefix"], ev["mode"], round_num, seed)
+            return results_root / f"{eval_id}.csv", results_root / f"{eval_id}.json"
+
+        # A completed eval whose CSV has gone missing must be redone.
+        for ev in evals:
+            if ev["status"] == "completed" and not result_paths(ev)[0].exists():
+                ev["status"] = "pending"
+        if entry["status"] == "completed" and all(ev["status"] == "completed" for ev in evals):
             print(f"[batch] [{idx}/{total_runs}] skipping completed {run_id}", flush=True)
             continue
-        if entry["status"] == "completed" and not csv_path.exists():
+        if entry["status"] == "completed":
             entry["status"] = "trained"
 
         # --- training phase -----------------------------------------------------------
@@ -561,57 +576,70 @@ def run_batch_study(
 
         # --- evaluation phase ---------------------------------------------------------
         if entry["status"] in ("trained", "evaluating"):
-            print(
-                f"\n[batch] [{idx}/{total_runs}] evaluating {run_id} "
-                f"(split={state['split']})",
-                flush=True,
-            )
-            entry["status"] = "evaluating"
-            entry["last_error"] = None
-            state["current_run_id"] = run_id
-            save_study_state(study_dir, state)
-
-            cmd = _eval_command(eval_script, run_dir, csv_path, json_path, state)
-            rc, interrupted = _run_subprocess_interruptible(cmd)
-
-            eval_partial = False
-            if json_path.exists():
-                try:
-                    eval_partial = bool(
-                        json.loads(json_path.read_text(encoding="utf-8")).get("partial", False)
-                    )
-                except json.JSONDecodeError:
-                    eval_partial = True
-
-            if rc == 0 and not interrupted and not eval_partial and csv_path.exists():
-                entry["status"] = "completed"
-                entry["csv_path"] = str(csv_path.relative_to(study_dir))
-                entry["json_path"] = (
-                    str(json_path.relative_to(study_dir)) if json_path.exists() else None
+            for ev in evals:
+                if ev["status"] == "completed":
+                    continue
+                eval_mode = ev["mode"]
+                csv_path, json_path = result_paths(ev)
+                label = f"{run_id} as {eval_mode}" if eval_mode != entry["mode"] else run_id
+                print(
+                    f"\n[batch] [{idx}/{total_runs}] evaluating {label} "
+                    f"(split={state['split']})",
+                    flush=True,
                 )
-                entry["last_error"] = None
+                entry["status"] = "evaluating"
+                ev["status"] = "evaluating"
+                ev["last_error"] = None
+                state["current_run_id"] = run_id
                 save_study_state(study_dir, state)
-            else:
+
+                cmd = _eval_command(eval_script, run_dir, csv_path, json_path, state, eval_mode)
+                rc, interrupted = _run_subprocess_interruptible(cmd)
+
+                eval_partial = False
+                if json_path.exists():
+                    try:
+                        eval_partial = bool(
+                            json.loads(json_path.read_text(encoding="utf-8")).get("partial", False)
+                        )
+                    except json.JSONDecodeError:
+                        eval_partial = True
+
+                if rc == 0 and not interrupted and not eval_partial and csv_path.exists():
+                    ev["status"] = "completed"
+                    ev["csv_path"] = str(csv_path.relative_to(study_dir))
+                    ev["json_path"] = (
+                        str(json_path.relative_to(study_dir)) if json_path.exists() else None
+                    )
+                    ev["last_error"] = None
+                    save_study_state(study_dir, state)
+                    continue
+
                 # Never keep partial evaluation outputs as study results.
                 csv_path.unlink(missing_ok=True)
                 json_path.unlink(missing_ok=True)
+                ev["status"] = "pending"
                 entry["status"] = "trained"
                 if interrupted or rc == 130 or eval_partial:
                     _pause_and_exit(
                         study_dir,
                         state,
                         run_id,
-                        f"interrupted during evaluation of {run_id}",
+                        f"interrupted during evaluation of {label}",
                         code=130,
                     )
-                entry["last_error"] = f"evaluate.py exited with code {rc}"
+                ev["last_error"] = f"evaluate.py exited with code {rc}"
                 _pause_and_exit(
                     study_dir,
                     state,
                     run_id,
-                    f"evaluate.py failed for {run_id} with exit code {rc}",
+                    f"evaluate.py failed for {label} with exit code {rc}",
                     code=rc or 1,
                 )
+
+            entry["status"] = "completed"
+            entry["last_error"] = None
+            save_study_state(study_dir, state)
 
     # --- final aggregation ------------------------------------------------------------
     csv_summary, txt_summary = write_study_summaries(study_dir, state)

@@ -1,8 +1,12 @@
 """Batch study orchestration helpers, state management, Fisher Z aggregation, and summaries.
 
-A batch study runs a set of training modes (subset of `heads`, `ce-std`, `ce-rail`, `raft-rail`)
+A batch study evaluates a set of modes (subset of `heads`, `ce-std`, `ce-rail`, `raft-rail`)
 across a sequence of fixed seeds in round-robin order, serially, storing every artifact except
 the standard train/eval logs inside `batch-studies/<prefix>/`.
+
+Modes are what gets evaluated and reported; training runs are what gets trained. `ce-std` and
+`ce-rail` share one training objective and differ only in their inference readout, so both are
+evaluated from a single `ce` training run.
 
 At the end of a study, per-run Pearson correlations are combined across seeds using Fisher's
 Z-transformation: average in `arctanh` space, compute the Student-t 95% confidence interval in
@@ -27,16 +31,26 @@ from .engine import RESUME_META
 from .reporting import BASELINES, REPORT_FIELDS, Baseline, read_metrics_csv
 from .tokens import UNTRAINED_FIELDS
 
-#: Canonical round-robin order for batch studies.
+#: Canonical order of evaluated (reported) modes.
 MODES: tuple[str, ...] = ("heads", "ce-std", "ce-rail", "raft-rail")
 
-#: CLI flag passed to `train.py` for each mode.
+#: Canonical round-robin order of training runs, and the modes each one is evaluated as.
+TRAIN_MODES: dict[str, tuple[str, ...]] = {
+    "heads": ("heads",),
+    "ce": ("ce-std", "ce-rail"),
+    "raft-rail": ("raft-rail",),
+}
+
+#: CLI flag passed to `train.py` for each training mode. `ce` trains under `--ce-std`; the
+#: objective is identical to `--ce-rail`, only the readout used for validation logging differs.
 MODE_TO_FLAG: dict[str, tuple[str, ...]] = {
     "heads": (),
-    "ce-std": ("--ce-std",),
-    "ce-rail": ("--ce-rail",),
+    "ce": ("--ce-std",),
     "raft-rail": ("--raft-rail",),
 }
+
+#: `evaluate.py --eval-variant` for each evaluated mode that needs one.
+EVAL_VARIANT: dict[str, str] = {"ce-std": "ce_std", "ce-rail": "ce_rail"}
 
 STUDY_STATE_FILE = "study_state.json"
 
@@ -93,22 +107,39 @@ def make_run_id(prefix: str, mode: str, round_num: int, seed: int) -> str:
     return f"{prefix}_{mode}_{round_num}_{seed}"
 
 
+def new_eval_entry(mode: str) -> dict:
+    return {
+        "mode": mode,
+        "status": "pending",
+        "csv_path": None,
+        "json_path": None,
+        "last_error": None,
+    }
+
+
 def build_schedule(prefix: str, modes: Sequence[str], seeds: Sequence[int]) -> list[dict]:
-    """Round-robin schedule: for round i (1..N) with seed[i], run each active mode in order."""
+    """Round-robin schedule: for round i (1..N) with seed[i], train each needed run in order.
+
+    A training run is scheduled when at least one of its evaluated modes is active, and carries
+    one evaluation entry per active mode it serves.
+    """
+    active = set(modes)
     runs: list[dict] = []
     for round_num, seed in enumerate(seeds, start=1):
-        for mode in modes:
+        for train_mode, eval_modes in TRAIN_MODES.items():
+            evals = [m for m in eval_modes if m in active]
+            if not evals:
+                continue
             runs.append(
                 {
-                    "run_id": make_run_id(prefix, mode, round_num, seed),
-                    "mode": mode,
+                    "run_id": make_run_id(prefix, train_mode, round_num, seed),
+                    "mode": train_mode,
                     "round": round_num,
                     "seed": seed,
                     "status": "pending",
                     "resumable": False,
-                    "csv_path": None,
-                    "json_path": None,
                     "last_error": None,
+                    "evals": [new_eval_entry(m) for m in evals],
                 }
             )
     return runs
@@ -171,7 +202,13 @@ def load_study_state(study_dir: Path) -> dict:
         raise SystemExit(
             f"no batch study state found at {path} — check the --prefix and try again"
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if any("evals" not in entry for entry in state.get("runs", [])):
+        raise SystemExit(
+            f"{path} uses the old one-run-per-mode schema (before ce-std and ce-rail shared a "
+            "training run); migrate it before resuming"
+        )
+    return state
 
 
 def find_paused_studies(batch_root: Path) -> list[dict]:
@@ -285,14 +322,14 @@ def collect_study_pccs(
     pccs: dict[str, dict[str, list[float]]] = {mode: {} for mode in modes}
     observed_keys: set[str] = set()
 
-    for entry in state["runs"]:
-        csv_rel = entry.get("csv_path")
+    for entry, ev in ((e, ev) for e in state["runs"] for ev in e.get("evals", [])):
+        csv_rel = ev.get("csv_path")
         if not csv_rel:
             continue
         csv_path = Path(csv_rel) if Path(csv_rel).is_absolute() else study_dir / csv_rel
         if not csv_path.exists():
             continue
-        mode = entry["mode"]
+        mode = ev["mode"]
         round_idx = int(entry["round"]) - 1
         for row in read_metrics_csv(csv_path):
             key = row["metric_key"]

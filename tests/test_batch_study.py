@@ -73,8 +73,10 @@ def _write_fake_scripts(tmp_path: Path) -> tuple[Path, Path, Path]:
 
     The stub evaluate script:
     - Records every invocation to the shared trace file.
-    - When `FAKE_PAUSE_EVAL_RUN_ID` matches the current run_id (on its first eval attempt),
-      signals readiness and waits for SIGINT, writing a partial JSON and exiting 130.
+    - When `FAKE_PAUSE_EVAL_RUN_ID` matches the current run_id (and `FAKE_PAUSE_EVAL_MODE`, if
+      set, matches the evaluated mode) on its first pause, signals readiness and waits for
+      SIGINT, writing a partial JSON and exiting 130.
+    - Honours `--eval-variant`, reporting the run as that mode.
     - Otherwise writes deterministic per-run CSV and JSON files via `write_metrics_csv`.
     """
     trace_file = tmp_path / "trace.jsonl"
@@ -169,24 +171,30 @@ parser.add_argument("--no-bootstrap", action="store_true")
 parser.add_argument("--snap", action="store_true")
 parser.add_argument("--out", default="")
 parser.add_argument("--out-csv", default="")
+parser.add_argument("--eval-variant", default="")
 args = parser.parse_args()
 
 run_dir = Path(args.run_dir)
 meta = json.loads((run_dir / "config.json").read_text())
 run_id = meta["run_id"]
-mode = meta["mode"]
+mode = args.eval_variant.replace("_", "-") if args.eval_variant else meta["mode"]
 seed = int(meta["seed"])
 
 with open({str(trace_file)!r}, "a", encoding="utf-8") as fh:
     fh.write(json.dumps({{
         "cmd": "eval", "run_id": run_id, "run_dir": str(run_dir),
-        "split": args.split, "out_csv": args.out_csv,
+        "split": args.split, "out_csv": args.out_csv, "mode": mode,
     }}) + "\\n")
 
 pause_eval = os.environ.get("FAKE_PAUSE_EVAL_RUN_ID", "")
+pause_eval_mode = os.environ.get("FAKE_PAUSE_EVAL_MODE", "")
 ready_file = os.environ.get("FAKE_EVAL_READY_FILE", "")
 paused_marker = run_dir / ".eval_paused_once"
-if pause_eval == run_id and not paused_marker.exists():
+if (
+    pause_eval == run_id
+    and pause_eval_mode in ("", mode)
+    and not paused_marker.exists()
+):
     with graceful_interrupt() as interrupt:
         if ready_file:
             Path(ready_file).write_text("ready")
@@ -332,15 +340,37 @@ def test_schedule_is_round_robin_with_seed_depending_only_on_round():
     schedule = build_schedule("alpha", modes, [42, 43])
     assert [r["run_id"] for r in schedule] == [
         "alpha_heads_1_42",
-        "alpha_ce-std_1_42",
-        "alpha_ce-rail_1_42",
+        "alpha_ce_1_42",
         "alpha_raft-rail_1_42",
         "alpha_heads_2_43",
-        "alpha_ce-std_2_43",
-        "alpha_ce-rail_2_43",
+        "alpha_ce_2_43",
         "alpha_raft-rail_2_43",
     ]
+    # ce-std and ce-rail share one training run and are evaluated from it separately.
+    assert [[ev["mode"] for ev in r["evals"]] for r in schedule[:3]] == [
+        ["heads"], ["ce-std", "ce-rail"], ["raft-rail"],
+    ]
     assert make_run_id("alpha", "raft-rail", 1, 42) == "alpha_raft-rail_1_42"
+
+
+def test_schedule_drops_excluded_evals_and_runs_with_none_left():
+    schedule = build_schedule("alpha", resolve_modes({"ce-std"}), [42])
+    assert [(r["run_id"], [ev["mode"] for ev in r["evals"]]) for r in schedule] == [
+        ("alpha_heads_1_42", ["heads"]),
+        ("alpha_ce_1_42", ["ce-rail"]),
+        ("alpha_raft-rail_1_42", ["raft-rail"]),
+    ]
+    schedule = build_schedule("alpha", resolve_modes({"ce-std", "ce-rail"}), [42])
+    assert [r["run_id"] for r in schedule] == ["alpha_heads_1_42", "alpha_raft-rail_1_42"]
+
+
+def test_old_schema_study_state_is_refused(tmp_path):
+    (tmp_path / STUDY_STATE_FILE).write_text(
+        json.dumps({"prefix": "old", "runs": [{"run_id": "old_ce-std_1_1", "mode": "ce-std"}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="old one-run-per-mode schema"):
+        load_study_state(tmp_path)
 
 
 def test_mode_exclusions_preserve_round_robin_order():
@@ -416,7 +446,7 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
     batch_root = tmp_path / "batch-studies"
 
     study_dir = batch_study.run_batch_study(
-        ["--prefix", "alpha", "--seeds", "42,43,44", "--no-ce-std"],
+        ["--prefix", "alpha", "--seeds", "42,43,44"],
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
@@ -424,25 +454,34 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
     assert study_dir == batch_root / "alpha"
     assert find_paused_studies(batch_root) == []
 
-    # Verify exact serial round-robin execution order: train then eval for each run.
+    # Verify exact serial round-robin execution order: train then its eval(s) for each run.
     events = [json.loads(line) for line in trace_file.read_text().splitlines()]
-    expected_ids = [
-        "alpha_heads_1_42", "alpha_ce-rail_1_42", "alpha_raft-rail_1_42",
-        "alpha_heads_2_43", "alpha_ce-rail_2_43", "alpha_raft-rail_2_43",
-        "alpha_heads_3_44", "alpha_ce-rail_3_44", "alpha_raft-rail_3_44",
+    seeds = [(1, 42), (2, 43), (3, 44)]
+    expected_train = [
+        f"alpha_{m}_{r}_{s}" for r, s in seeds for m in ("heads", "ce", "raft-rail")
     ]
-    assert [e["run_id"] for e in events if e["cmd"] == "train"] == expected_ids
-    assert [e["run_id"] for e in events if e["cmd"] == "eval"] == expected_ids
-    # Every train event is immediately followed by its eval event.
-    for i in range(0, len(events), 2):
-        assert events[i]["cmd"] == "train"
-        assert events[i + 1]["cmd"] == "eval"
-        assert events[i]["run_id"] == events[i + 1]["run_id"]
+    expected_sequence = []
+    for r, s in seeds:
+        expected_sequence += [
+            ("train", f"alpha_heads_{r}_{s}"), ("eval", f"alpha_heads_{r}_{s}", "heads"),
+            ("train", f"alpha_ce_{r}_{s}"),
+            ("eval", f"alpha_ce_{r}_{s}", "ce-std"), ("eval", f"alpha_ce_{r}_{s}", "ce-rail"),
+            ("train", f"alpha_raft-rail_{r}_{s}"),
+            ("eval", f"alpha_raft-rail_{r}_{s}", "raft-rail"),
+        ]
+    assert [
+        (e["cmd"], e["run_id"]) if e["cmd"] == "train" else (e["cmd"], e["run_id"], e["mode"])
+        for e in events
+    ] == expected_sequence
+    # The shared ce run trains once, under --ce-std.
+    assert {e["mode"] for e in events if e["cmd"] == "train" and "_ce_" in e["run_id"]} == {"ce-std"}
 
-    # Every run has weights under batch-studies/alpha/runs/<run_id> and a CSV under results/.
-    for rid in expected_ids:
+    # Every training run has weights under runs/<run_id>; every evaluated mode has a CSV.
+    for rid in expected_train:
         assert (study_dir / "runs" / rid / "heads.safetensors").exists()
-        assert (study_dir / "results" / f"{rid}.csv").exists()
+    for r, s in seeds:
+        for mode in MODES:
+            assert (study_dir / "results" / f"alpha_{mode}_{r}_{s}.csv").exists()
 
     state = load_study_state(study_dir)
     assert state["status"] == "completed"
@@ -458,7 +497,7 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
         "mean_pcc", "stddev_pcc", "ci95_lo", "ci95_hi",
     ]
 
-    expected_models = ["heads", "ce-rail", "raft-rail"] + [b.name for b in BASELINES]
+    expected_models = list(MODES) + [b.name for b in BASELINES]
     assert len(rows) == len(expected_models) * len(APPLICABLE_FIELDS)
     assert "utterance.completeness" not in {r["score_type"] for r in rows}
 
@@ -472,6 +511,10 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
         float(heads_phone["round_3_seed_44"]),
     ]
     ref = fisher_z_summary(individual)
+    # The two ce readouts come from one training run but are reported as separate models.
+    ce_std = next(r for r in rows if r["model"] == "ce-std" and r["score_type"] == "phone.accuracy")
+    ce_rail = next(r for r in rows if r["model"] == "ce-rail" and r["score_type"] == "phone.accuracy")
+    assert ce_std["round_1_seed_42"] != ce_rail["round_1_seed_42"]
     assert float(heads_phone["mean_pcc"]) == pytest.approx(ref.mean_pcc, abs=1e-12)
     assert float(heads_phone["stddev_pcc"]) == pytest.approx(ref.stddev_pcc, abs=1e-12)
     assert float(heads_phone["ci95_lo"]) == pytest.approx(ref.ci95_lo, abs=1e-12)
@@ -531,7 +574,7 @@ batch_study.run_batch_study(
     )
 
     env = os.environ.copy()
-    env["FAKE_PAUSE_RUN_ID"] = "alpha_ce-std_1_42"
+    env["FAKE_PAUSE_RUN_ID"] = "alpha_ce_1_42"
     env["FAKE_READY_FILE"] = str(ready_file)
 
     proc = subprocess.Popen(
@@ -561,11 +604,11 @@ batch_study.run_batch_study(
     study_dir = batch_root / "alpha"
     state = load_study_state(study_dir)
     assert state["status"] == "paused"
-    assert state["current_run_id"] == "alpha_ce-std_1_42"
-    assert (study_dir / "runs" / "alpha_ce-std_1_42" / "resume.json").exists()
+    assert state["current_run_id"] == "alpha_ce_1_42"
+    assert (study_dir / "runs" / "alpha_ce_1_42" / "resume.json").exists()
     statuses = {r["run_id"]: r["status"] for r in state["runs"]}
     assert statuses["alpha_heads_1_42"] == "completed"
-    assert statuses["alpha_ce-std_1_42"] == "training"
+    assert statuses["alpha_ce_1_42"] == "training"
     assert statuses["alpha_heads_2_43"] == "pending"
 
     # Starting any new study while paused must warn and exit.
@@ -595,15 +638,15 @@ batch_study.run_batch_study(
     )
     final_state = load_study_state(study_dir)
     assert final_state["status"] == "completed"
-    assert not (study_dir / "runs" / "alpha_ce-std_1_42" / "resume.json").exists()
+    assert not (study_dir / "runs" / "alpha_ce_1_42" / "resume.json").exists()
     assert (study_dir / "summary.csv").exists()
     assert (study_dir / "summary.txt").exists()
 
-    # Verify alpha_heads_1_42 was NOT retrained, and alpha_ce-std_1_42 resumed with --resume.
+    # Verify alpha_heads_1_42 was NOT retrained, and alpha_ce_1_42 resumed with --resume.
     events = [json.loads(line) for line in trace_file.read_text().splitlines()]
     heads_1_trains = [e for e in events if e["cmd"] == "train" and e["run_id"] == "alpha_heads_1_42"]
     assert len(heads_1_trains) == 1
-    cestd_1_trains = [e for e in events if e["cmd"] == "train" and e["run_id"] == "alpha_ce-std_1_42"]
+    cestd_1_trains = [e for e in events if e["cmd"] == "train" and e["run_id"] == "alpha_ce_1_42"]
     assert [e["resumed"] for e in cestd_1_trains] == [False, True]
 
 
@@ -676,6 +719,82 @@ batch_study.run_batch_study(
     assert load_study_state(study_dir)["status"] == "completed"
 
 
+def test_sigint_during_second_ce_eval_resumes_only_that_eval(tmp_path):
+    """Pausing the ce-rail eval of a shared ce run keeps ce-std's result and redoes only ce-rail."""
+    fake_train, fake_eval, trace_file = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+    ready_file = tmp_path / "eval_ready.txt"
+    repo_root = Path(__file__).resolve().parents[1]
+
+    runner = tmp_path / "run_wrapper.py"
+    runner.write_text(
+        f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(repo_root)!r})
+import batch_study
+batch_study.run_batch_study(
+    sys.argv[1:],
+    batch_root=Path({str(batch_root)!r}),
+    train_script=Path({str(fake_train)!r}),
+    eval_script=Path({str(fake_eval)!r}),
+)
+""",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["FAKE_PAUSE_EVAL_RUN_ID"] = "alpha_ce_1_42"
+    env["FAKE_PAUSE_EVAL_MODE"] = "ce-rail"
+    env["FAKE_EVAL_READY_FILE"] = str(ready_file)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, str(runner),
+            "--prefix", "alpha", "--seeds", "42",
+            "--no-heads", "--no-raft-rail",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.time() + 10.0
+    while not ready_file.exists() and time.time() < deadline:
+        assert proc.poll() is None, f"process exited early: {proc.stderr.read()}"
+        time.sleep(0.02)
+    assert ready_file.exists()
+
+    proc.send_signal(signal.SIGINT)
+    proc.communicate(timeout=10)
+    assert proc.returncode == 130
+
+    study_dir = batch_root / "alpha"
+    state = load_study_state(study_dir)
+    entry = state["runs"][0]
+    assert entry["run_id"] == "alpha_ce_1_42"
+    assert entry["status"] == "trained"
+    assert {ev["mode"]: ev["status"] for ev in entry["evals"]} == {
+        "ce-std": "completed", "ce-rail": "pending",
+    }
+    assert (study_dir / "results" / "alpha_ce-std_1_42.csv").exists()
+    assert not (study_dir / "results" / "alpha_ce-rail_1_42.csv").exists()
+
+    batch_study.run_batch_study(
+        ["--resume", "--prefix", "alpha"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+    )
+    events = [json.loads(line) for line in trace_file.read_text().splitlines()]
+    assert [(e["cmd"], e.get("mode")) for e in events if e["cmd"] == "eval"] == [
+        ("eval", "ce-std"), ("eval", "ce-rail"), ("eval", "ce-rail"),
+    ]
+    assert len([e for e in events if e["cmd"] == "train"]) == 1
+    assert load_study_state(study_dir)["status"] == "completed"
+    assert (study_dir / "results" / "alpha_ce-rail_1_42.csv").exists()
+
+
 def test_train_and_evaluate_cli_accept_new_flags(monkeypatch):
     import evaluate
     import train
@@ -687,6 +806,13 @@ def test_train_and_evaluate_cli_accept_new_flags(monkeypatch):
     monkeypatch.setattr("sys.argv", ["evaluate.py", "--run-dir", "batch-studies/alpha/runs/alpha_heads_1_42", "--out-csv", "batch-studies/alpha/results/alpha_heads_1_42.csv"])
     e_args = evaluate.parse_args()
     assert e_args.out_csv == "batch-studies/alpha/results/alpha_heads_1_42.csv"
+    assert e_args.eval_variant == ""
+
+    monkeypatch.setattr("sys.argv", ["evaluate.py", "--eval-variant", "ce_rail"])
+    assert evaluate.parse_args().eval_variant == "ce_rail"
+    monkeypatch.setattr("sys.argv", ["evaluate.py", "--eval-variant", "raft_rail"])
+    with pytest.raises(SystemExit):
+        evaluate.parse_args()
 
 
 # --- --purge tests --------------------------------------------------------------------
@@ -709,10 +835,10 @@ def test_purge_reports_in_progress_status_and_respects_confirmation(tmp_path, mo
         extra_train_args=[],
     )
     state["status"] = "paused"
-    state["current_run_id"] = "alpha_ce-std_1_42"
+    state["current_run_id"] = "alpha_ce_1_42"
     state["runs"][0]["status"] = "completed"
     save_study_state(study_dir, state)
-    run_dir = study_dir / "runs" / "alpha_ce-std_1_42"
+    run_dir = study_dir / "runs" / "alpha_ce_1_42"
     run_dir.mkdir(parents=True)
     (run_dir / "resume.json").write_text('{"step": 5}', encoding="utf-8")
     (run_dir / "heads.safetensors").write_bytes(b"weights")

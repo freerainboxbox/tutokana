@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import torch
@@ -97,8 +97,17 @@ def parse_args() -> argparse.Namespace:
              "quantised and a continuous readout is not; snapping restores the ties a rank "
              "correlation is comparing against. Applied after the fact, no retraining",
     )
+    parser.add_argument(
+        "--eval-variant", default="", choices=("", *CE_VARIANTS),
+        help="evaluate a cross-entropy run as the other cross-entropy arm. `--ce-std` and "
+             "`--ce-rail` train identically and differ only in how a score is read off the "
+             "grid (mode vs expectation), so one trained run can be scored both ways",
+    )
     return parser.parse_args()
 
+
+#: Variants that share a training objective and differ only in their inference readout.
+CE_VARIANTS = ("ce_std", "ce_rail")
 
 BASE_SENTINEL = "base"
 
@@ -146,11 +155,20 @@ def main() -> None:
     meta = json.loads((run_dir / "config.json").read_text())
     config = cfg.Config.from_dict(meta["config"])
     run_id = meta.get("run_id", run_dir.name)
-    # A run directory records the variant it trained, so evaluating it cannot disagree with it.
+    # A run directory records the variant it trained, so evaluating it cannot disagree with
+    # it — except between the cross-entropy arms, whose training is the same objective.
+    if args.eval_variant and args.eval_variant != config.variant:
+        if config.variant not in CE_VARIANTS:
+            raise SystemExit(
+                f"--eval-variant {args.eval_variant} needs a run trained as one of "
+                f"{', '.join(CE_VARIANTS)}; {run_dir} was trained as {config.variant!r}"
+            )
+        config = replace(config, variant=args.eval_variant)
+    log_id = f"{run_id}-{config.variant.replace('_', '-')}" if args.eval_variant else run_id
     config.require_implemented()
 
     partial = False
-    with cfg.run_logging("eval", run_id) as log:
+    with cfg.run_logging("eval", log_id) as log:
         log.info("run %s (trained %s)", run_dir, meta.get("completed_at", "?"))
         seed_everything(config.train.seed)
         device = resolve_device(config.device)
@@ -206,6 +224,7 @@ def main() -> None:
         )
         if untuned:
             run_id = f"{run_id}-UNTUNED"
+            log_id = f"{log_id}-UNTUNED"
             log.info("[model] untuned baseline: stock weights, randomly initialised heads")
         else:
             model.load_trained(run_dir)
@@ -246,7 +265,7 @@ def main() -> None:
                 result.scored, len(utterances),
             )
 
-        title = f"{run_id} / {args.split}"
+        title = f"{log_id} / {args.split}"
         if config.emits_scores:
             # The Results table is teacher-forced. A variant feeds its own emitted scores
             # back, so the two are not the same measurement and must not share a title.
