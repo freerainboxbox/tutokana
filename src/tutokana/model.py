@@ -343,6 +343,14 @@ class TutokanaModel(nn.Module):
                 for k, v in self.register_delta.state_dict().items()
             }
         )
+        if self.config.train_audio_projection:
+            extra.update(
+                {
+                    f"audio_proj.{name}": param.detach().cpu().contiguous()
+                    for name, param in self.base.named_parameters()
+                    if "embed_audio" in name and param.requires_grad
+                }
+            )
         save_file(extra, str(run_dir / "heads.safetensors"))
 
     def load_trained(self, run_dir: Path) -> None:
@@ -357,12 +365,21 @@ class TutokanaModel(nn.Module):
             for k, v in blob.items()
             if k.startswith("register_delta.")
         }
+        audio_proj_state = {
+            k[len("audio_proj.") :]: v for k, v in blob.items() if k.startswith("audio_proj.")
+        }
         self.heads.load_state_dict(head_state, strict=False)
         # Not load_state_dict: the row count changes when the grid tokens join, and a size
         # mismatch raises even with strict=False. Rows merge by vocabulary id instead.
         saved = delta_state.get("delta")
         if saved is not None:
             self.register_delta.merge_state(saved, delta_state.get("_token_ids"))
+        if audio_proj_state:
+            params = dict(self.base.named_parameters())
+            with torch.no_grad():
+                for name, tensor in audio_proj_state.items():
+                    if name in params:
+                        params[name].copy_(tensor.to(device=params[name].device, dtype=params[name].dtype))
 
 
 def load_processor(model_id: str):

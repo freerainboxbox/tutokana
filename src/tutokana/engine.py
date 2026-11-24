@@ -43,12 +43,21 @@ logger = get_logger()
 MAX_ABS_TARGET = 60.0
 
 
+def _has_mps() -> bool:
+    return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if _has_mps():
+        torch.mps.manual_seed(seed)
+    if getattr(torch.backends, "cudnn", None) and torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 @contextmanager
@@ -125,22 +134,37 @@ def preflight(model, collator, samples: list[Utterance], device, loss_config: Lo
     if (batch["labels"] != -100).sum() == 0:
         raise SystemExit("[preflight] language-model loss mask is empty")
 
-    model.train()
-    head_outputs, lm_loss, score_logits = model(batch)
-    total, parts = composite_loss(
-        model.heads, head_outputs, batch["heads"], loss_config, buffer, reweighter, lm_loss,
-        score_logits=score_logits, supports=model.supports,
+    # Snapshot the correlation buffer so preflight still exercises host->device concatenation
+    # on a resumed buffer without polluting its FIFO history or evicting real training entries.
+    saved_buffer = (
+        (
+            {k: v.clone() for k, v in buffer._predictions.items()},
+            {k: v.clone() for k, v in buffer._targets.items()},
+        )
+        if buffer is not None
+        else None
     )
-    total.backward()
 
-    starved = [
-        key
-        for key in head_outputs
-        if all(p.grad is None or not p.grad.any() for p in model.heads.head(key).parameters())
-    ]
-    if starved:
-        raise SystemExit(f"[preflight] heads received no gradient: {starved}")
-    model.zero_grad(set_to_none=True)
+    try:
+        model.train()
+        head_outputs, lm_loss, score_logits = model(batch)
+        total, parts = composite_loss(
+            model.heads, head_outputs, batch["heads"], loss_config, buffer, reweighter, lm_loss,
+            score_logits=score_logits, supports=model.supports,
+        )
+        total.backward()
+
+        starved = [
+            key
+            for key in head_outputs
+            if all(p.grad is None or not p.grad.any() for p in model.heads.head(key).parameters())
+        ]
+        if starved:
+            raise SystemExit(f"[preflight] heads received no gradient: {starved}")
+    finally:
+        model.zero_grad(set_to_none=True)
+        if buffer is not None and saved_buffer is not None:
+            buffer._predictions, buffer._targets = saved_buffer
 
     counts = {k: len(v) for k, v in batch["heads"].items()}
     logger.info(
@@ -455,7 +479,12 @@ def rng_state() -> dict:
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "cuda": (
+            [s.cpu() for s in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else None
+        ),
+        "mps": torch.mps.get_rng_state().cpu() if _has_mps() else None,
     }
 
 
@@ -463,8 +492,22 @@ def restore_rng_state(state: dict) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"].to(torch.uint8).cpu())
-    if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+    if torch.cuda.is_available():
+        if state.get("cuda") is not None:
+            torch.cuda.set_rng_state_all([s.to(torch.uint8).cpu() for s in state["cuda"]])
+        else:
+            logger.warning(
+                "[resume] checkpoint has no saved CUDA RNG state; "
+                "dropout stream will not match an uninterrupted run"
+            )
+    if _has_mps():
+        if state.get("mps") is not None:
+            torch.mps.set_rng_state(state["mps"].to(torch.uint8).cpu())
+        else:
+            logger.warning(
+                "[resume] checkpoint has no saved MPS RNG state; "
+                "dropout stream will not match an uninterrupted run"
+            )
 
 
 def save_resume(
