@@ -158,7 +158,9 @@ class RegisterDelta(nn.Module):
             if hidden is None or not torch.is_tensor(hidden):
                 return output
             rows = ids.to(output.device)
-            extra = hidden.to(self.delta.dtype) @ self.delta.to(hidden.dtype).T
+            # The base runs in bf16 while the delta is kept in fp32; multiply in the delta's
+            # dtype so both operands agree and its gradient stays full precision.
+            extra = hidden.to(self.delta.dtype) @ self.delta.T
             output[..., rows] = output[..., rows] + extra.to(output.dtype)
             return output
 

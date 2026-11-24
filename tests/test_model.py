@@ -308,6 +308,24 @@ def test_emitted_delta_gives_gradient(tiny_base, processor):
     assert float(delta.delta.grad.abs().sum()) > 0.0
 
 
+def test_emitted_delta_handles_bf16_base(tiny_base, processor):
+    """Training runs the base in bf16 with an fp32 delta; the output hook must mix them.
+
+    Regression: the hook cast each operand to the *other's* dtype, so the matmul still saw
+    fp32 @ bf16 and crashed at preflight for every emitting mode.
+    """
+    model, delta, grid_ids = _emitted_model(tiny_base.to(torch.bfloat16), processor)
+    delta.to(torch.float32)
+    emb = model.base.get_input_embeddings()
+    lm = model.base.get_output_embeddings()
+    tok = torch.tensor([[2, grid_ids["1.0"]]])
+    logits = lm(emb(tok))
+    assert logits.dtype == torch.bfloat16
+    logits.float().sum().backward()
+    assert delta.delta.grad is not None
+    assert delta.delta.grad.dtype == torch.float32
+
+
 def test_head_path_leaves_logits_untouched(tiny_base, processor):
     """Default config keeps the regression-head path exactly as it was."""
     register_ids = register_tokens(processor.tokenizer)
