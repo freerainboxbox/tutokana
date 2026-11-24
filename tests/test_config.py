@@ -39,26 +39,38 @@ def test_no_flag_trains_the_regression_heads():
 @pytest.mark.parametrize(
     "argv,variant",
     [
+        (["--ce-std"], "ce_std"),
         (["--ce-rail"], "ce_rail"),
         (["--raft-rail"], "raft_rail"),
+        (["--variant", "ce_std"], "ce_std"),
         (["--variant", "ce_rail"], "ce_rail"),
         (["--variant", "raft_rail"], "raft_rail"),
     ],
 )
 def test_each_spelling_of_a_variant_reaches_the_config(argv, variant):
-    """`--ce-rail` is the spelling the README documents; `--variant` is the same dest."""
+    """`--ce-std` / `--ce-rail` are the README spellings; `--variant` is the same dest."""
     assert _config(argv).variant == variant
 
 
-def test_both_arms_at_once_is_rejected():
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--ce-std", "--ce-rail"],
+        ["--ce-std", "--raft-rail"],
+        ["--ce-rail", "--raft-rail"],
+    ],
+)
+def test_both_arms_at_once_is_rejected(argv):
     """The arms are alternatives. Last-flag-wins would train whichever parsed second."""
     with pytest.raises(SystemExit):
-        _config(["--ce-rail", "--raft-rail"])
+        _config(argv)
 
 
 def test_generic_and_aliased_spellings_cannot_be_combined():
     with pytest.raises(SystemExit):
         _config(["--variant", "ce_rail", "--raft-rail"])
+    with pytest.raises(SystemExit):
+        _config(["--variant", "ce_std", "--ce-rail"])
 
 
 def test_an_unknown_variant_is_rejected_at_the_parser():
@@ -86,15 +98,16 @@ def test_config_rejects_a_variant_outside_the_set(bad):
 def test_a_rejected_variant_names_the_ones_that_exist():
     with pytest.raises(SystemExit) as excinfo:
         Config(variant="rail")
-    assert "heads, ce_rail, raft_rail" in str(excinfo.value)
+    assert "heads, ce_std, ce_rail, raft_rail" in str(excinfo.value)
 
 
 # --- resume: the variant must survive the round trip ----------------------------------
 
 
-def test_variant_survives_the_config_round_trip():
+@pytest.mark.parametrize("flag,variant", [("--ce-std", "ce_std"), ("--raft-rail", "raft_rail")])
+def test_variant_survives_the_config_round_trip(flag, variant):
     """The resume file is `asdict(config)`, so an unwritten field resumes as the default."""
-    assert Config.from_dict(_config(["--raft-rail"]).to_dict()).variant == "raft_rail"
+    assert Config.from_dict(_config([flag]).to_dict()).variant == variant
 
 
 def test_a_run_recorded_before_variants_exists_resumes_as_heads():
@@ -150,10 +163,17 @@ def test_every_declared_variant_runs(variant):
     assert Config(variant=variant).require_implemented() is None
 
 
-def test_ce_rail_without_a_text_loss_would_train_nothing():
-    """Cross-entropy on the emitted token is this arm's only score supervision."""
+@pytest.mark.parametrize("variant", ["ce_std", "ce_rail"])
+def test_ce_arms_without_a_text_loss_would_train_nothing(variant):
+    """Cross-entropy on the emitted token is these arms' only score supervision."""
     with pytest.raises(SystemExit, match="trains nothing"):
-        Config(variant="ce_rail", lambda_lm=0.0)
+        Config(variant=variant, lambda_lm=0.0)
+
+
+def test_raft_rail_without_a_raft_loss_would_train_nothing():
+    """The score token is masked from CE under `--raft-rail`, so lambda_raft=0 trains no score."""
+    with pytest.raises(SystemExit, match="trains nothing"):
+        Config(variant="raft_rail", lambda_raft=0.0)
 
 
 def test_only_declared_variants_can_be_listed_as_missing(monkeypatch):
@@ -164,9 +184,28 @@ def test_only_declared_variants_can_be_listed_as_missing(monkeypatch):
 
 
 def test_emits_scores_is_the_single_switch_downstream_code_reads():
-    """The mask, the loss and the decode loop all key off this, so the arms cannot drift."""
+    """The mask, the loss and the decode loop all key off these properties, so arms cannot drift."""
     assert {v: Config(variant=v).emits_scores for v in VARIANTS} == {
         "heads": False,
+        "ce_std": True,
         "ce_rail": True,
         "raft_rail": True,
+    }
+    assert {v: Config(variant=v).score_ce for v in VARIANTS} == {
+        "heads": False,
+        "ce_std": True,
+        "ce_rail": True,
+        "raft_rail": False,
+    }
+    assert {v: Config(variant=v).uses_raft for v in VARIANTS} == {
+        "heads": False,
+        "ce_std": False,
+        "ce_rail": False,
+        "raft_rail": True,
+    }
+    assert {v: Config(variant=v).score_readout for v in VARIANTS} == {
+        "heads": "expectation",
+        "ce_std": "mode",
+        "ce_rail": "expectation",
+        "raft_rail": "expectation",
     }

@@ -51,7 +51,7 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 - `TargetSpec.emit_scores` turns the register into a trigger. `render_target` then writes one grid token after every score register, so the score is in the text and later tokens attend to it. The renderer takes a grid-string to token map, because a score never reaches the text as digits: `1.8` is three tokens and sits off the grid.
 - `prompting.slot_value` is the single definition of what a slot carries. The renderer reads it to pick the token, and the collator reads it to build the head target. Two copies would let the token and the head target disagree, and no test would notice.
 - The mask treats a trigger and a score differently, and that is the whole point. A register is always masked: under the head path the model never emits one, and under a variant a trigger is punctuation fixed by the transcript. A score token is the prediction, so `Collator.score_ce` decides who supervises it.
-- `score_ce=True` is `--ce-rail`. Cross-entropy reaches the token. `score_ce=False` is `--raft-rail`. There the token is only a rendering of the expectation, so leaving it in the mask would re-add the mode-seeking term that arm exists to remove.
+- `score_ce=True` is `--ce-std` and `--ce-rail`. Cross-entropy reaches the token. `score_ce=False` is `--raft-rail`. There the token is only a rendering of the expectation, so leaving it in the mask would re-add the mode-seeking term that arm exists to remove.
 - A slot with no label emits **no token at all**. The synthetic negatives pair a transcript with unrelated audio, so their words have no stress pattern to judge. Inventing a score to keep the shape uniform would put a made-up number in the context of every later token. The register stays, the next register follows it, and nothing at that position is supervised.
 - A variant builds no regression heads. The scores are in the text, so a head on the same field would be a second channel in one run. The arm would then not be the one documented under **Variants**. The collator still emits per-field positions and gold, because scoring and the RAFT loss both need them, so `HeadBank.read` skips keys the bank does not hold. With an empty bank the forward pass also stops requesting hidden states, which is the largest activation in the pass.
 - Both arms emit byte-identical text. They differ only in the mask, so a difference in results cannot come from the data.
@@ -250,21 +250,23 @@ Each ablation is a flag. The defaults use the current best configuration. Every 
 
 A variant changes the output channel rather than a term inside it, so it is not a subtraction from the current model. It is a different model that shares the data path, the turn shape and the evaluation.
 
-**Both arms run. Neither has a number yet.** `--ce-rail` and `--raft-rail` both train and score end to end. No run has been launched, so nothing below is a result:
+**All three arms run. None has a number yet.** `--ce-std`, `--ce-rail` and `--raft-rail` all train and score end to end. No run has been launched, so nothing below is a result:
 
 | flag | training loss | inference | status |
 | --- | --- | --- | --- |
+| `--ce-std` | plain cross-entropy on the emitted score token | mode-seeking (argmax) over the grid | runs, no result yet |
 | `--ce-rail` | plain cross-entropy on the emitted score token | RAIL: expected value over the grid | runs, no result yet |
 | `--raft-rail` | RAFT: squared error of the grid expectation | RAIL: expected value over the grid | runs, no result yet |
 
-Each arm needs its own score term switched on: `--ce-rail` needs `--lambda-lm` above zero and `--raft-rail` needs `--lambda-raft` above zero, because for each one that term is the only score supervision the arm has. The config refuses both combinations rather than running for hours on an objective with no score in it. `--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was both arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
+Each arm needs its own score term switched on: `--ce-std` and `--ce-rail` need `--lambda-lm` above zero and `--raft-rail` needs `--lambda-raft` above zero, because for each one that term is the only score supervision the arm has. The config refuses these combinations rather than running for hours on an objective with no score in it. `--variant ce_std`, `--variant ce_rail` and `--variant raft_rail` are the same dest, and the arms are mutually exclusive. `variant` is one closed field rather than a boolean per arm, because a run that was multiple arms at once has no meaning for `--resume` to report. A run directory written before the field existed resumes as `heads`.
 
 A flag for an arm that cannot yet train refuses before anything loads, and names what is missing. That guard is empty now and stays as the mechanism: a parsed flag nothing reads would train the head model, record the variant in its own `config.json`, and be indistinguishable from a real result.
 
-Both arms share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it. That token is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
+All three arms share one mechanism. A register stops being a place to read a head and becomes a **trigger**. The model emits the trigger itself, then emits one score token for it, restricted to that field's grid. Under `--ce-std` that token is the argmax on the grid (naive mode-seeking autoregression); under `--ce-rail` and `--raft-rail` it is the nearest grid value to the current expectation. The text stream therefore carries the model's own belief, and later tokens attend to it.
 
-That reinjection is the point. Without it the model is a feature extractor with a regressor bolted on, which is the predictive-head design this project rejected. The two arms also separate the two halves of the RAFT paper's argument, and reading them needs both:
+That reinjection is the point. Without it the model is a feature extractor with a regressor bolted on, which is the predictive-head design this project rejected. The three arms form a ladder that establishes the baseline and then separates the two halves of the RAFT paper's argument:
 
+- `--ce-std` is the naive autoregressive MLM baseline: plain cross-entropy training with greedy argmax decoding restricted to each field's grid tokens (and majority mapping `votes >= 3 -> 10` else `5` on `word.stress`). It measures what a standard multimodal LM outputs before either RAIL or RAFT is applied.
 - `--ce-rail` changes only the decision rule. RAIL fixes how a value is read out, but it cannot repair a distribution that cross-entropy already made mode-seeking. On word stress this arm is **predicted to lose**, and a loss here is a result rather than a bug.
 - `--raft-rail` changes the objective, so the trained distribution matches the one the readout assumes. This is where the paper's argument applies.
 

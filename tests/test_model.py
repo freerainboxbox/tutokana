@@ -869,3 +869,122 @@ def test_raft_loss_descends_when_stepped_on_the_grid(raft):
         if first is None:
             first = float(loss.detach())
     assert float(loss.detach()) < first / 10, (first, float(loss.detach()))
+
+
+# --- the --ce-std arm: mode-seeking autoregression restricted to the grid ----------------
+
+
+def test_mode_readout_picks_the_argmax_token_and_differs_from_expectation(emitted):
+    """`--ce-std` reports the argmax grid token directly instead of the expectation."""
+    from tutokana.rail import grid_supports
+
+    support = grid_supports(emitted[1].grid_ids)["phone.accuracy"]
+    # Mode is 2.0 (highest logit), while substantial mass on low values pulls the expectation
+    # well below 2.0. RAIL reports the expectation; `--ce-std` collapses onto the mode.
+    logits = torch.full((1, len(support.token_ids)), -10.0)
+    logits[0, 0] = 1.9   # 0.0
+    logits[0, 1] = 1.9   # 0.2
+    logits[0, -1] = 2.0  # 2.0 (the mode)
+
+    assert int(support.mode_token(logits)[0]) == int(support.token_ids[-1])
+    assert float(support.mode(logits)) == pytest.approx(2.0)
+    assert float(support.report_mode(logits)) == pytest.approx(2.0)
+    assert float(support.report(logits)) < 1.5
+
+
+def test_mode_readout_is_restricted_to_the_fields_grid(emitted):
+    """A huge logit on an ordinary token or on another field's grid must not escape this grid."""
+    from tutokana.rail import grid_supports
+
+    supports = grid_supports(emitted[1].grid_ids)
+    phone = supports["phone.accuracy"]
+    word = supports["word.accuracy"]
+
+    full = torch.full((1, VOCAB), -20.0)
+    full[0, 5] = 100.0                           # ordinary vocabulary token
+    full[0, int(word.token_ids[-1])] = 100.0     # integer "10", valid for word but not phone
+    full[0, int(phone.token_ids[3])] = 1.0       # decimal "0.6", the best token on phone's grid
+
+    grid_logits = phone.restrict(full)
+    assert int(phone.mode_token(grid_logits)[0]) == int(phone.token_ids[3])
+    assert float(phone.report_mode(grid_logits)) == pytest.approx(float(phone.values[3]))
+
+
+def test_mode_readout_maps_stress_votes_through_majority(emitted):
+    """`word.stress` grids 0-5 votes, so mode readout maps the chosen vote to 5 or 10."""
+    from tutokana.rail import grid_supports
+
+    support = grid_supports(emitted[1].grid_ids)["word.stress"]
+    for votes, expected_median in [(0, 5.0), (2, 5.0), (3, 10.0), (5, 10.0)]:
+        logits = torch.full((1, len(support.token_ids)), -20.0)
+        logits[0, votes] = 5.0
+        assert float(support.mode(logits)) == pytest.approx(float(votes))
+        assert float(support.report_mode(logits)) == pytest.approx(expected_median)
+
+    # Mode is vote 2 (< 3 -> 5.0), while combined mass on votes 3 and 4 exceeds 0.5 (> 7.5).
+    # This separates mode-seeking from RAIL's P(votes >= 3) readout.
+    split = torch.tensor([[-20.0, -20.0, 2.0, 1.9, 1.9, -20.0]])
+    assert float(support.report_mode(split)) == pytest.approx(5.0)
+    assert float(support.report(split)) > 7.5
+
+
+def test_ce_std_scoring_outputs_discrete_grid_values_and_reinjects_mode(emitted):
+    """End-to-end `--ce-std`: every prediction lands on the grid, and reinjection still fires."""
+    from tutokana.rail import grid_supports
+
+    model, collator, sample = emitted
+    result = score(model, collator, sample, CPU, bootstrap=False, readout="mode")
+    supports = grid_supports(collator.grid_ids)
+
+    assert set(result.metrics) == set(result.predictions)
+    assert result.predictions
+    for key, prediction in result.predictions.items():
+        assert len(prediction) == len(result.gold[key]), key
+        assert np.isfinite(prediction).all(), key
+        allowed = (
+            {5.0, 10.0}
+            if key == "word.stress"
+            else set(round(v, 4) for v in supports[key].values.tolist())
+        )
+        assert {round(float(v), 4) for v in prediction} <= allowed, (key, prediction)
+
+    # Reinjection check: pushing one phone score token's delta moves later scores in mode readout.
+    batch = move_batch(collator(sample[:1]), CPU)
+    first = emitted_row(model, batch, supports, readout="mode")
+    second = emitted_row(model, batch, supports, readout="mode")
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+
+    phone = supports["phone.accuracy"]
+    row = model.register_delta.token_ids.index(int(phone.token_ids[0]))
+    other = model.register_delta.token_ids.index(int(phone.token_ids[-1]))
+    original = model.register_delta.delta.clone()
+    with torch.no_grad():
+        model.register_delta.delta[row] = 40.0
+    pushed_low = emitted_row(model, batch, supports, readout="mode")
+    with torch.no_grad():
+        model.register_delta.delta.copy_(original)
+        model.register_delta.delta[other] = 40.0
+    pushed_high = emitted_row(model, batch, supports, readout="mode")
+    with torch.no_grad():
+        model.register_delta.delta.copy_(original)
+
+    # Confirm the forced phone token actually changed and downstream outputs saw it.
+    assert not torch.equal(pushed_low["phone.accuracy"], pushed_high["phone.accuracy"])
+    assert any(
+        not torch.equal(pushed_low[k], pushed_high[k])
+        for k in pushed_low
+        if k != "phone.accuracy"
+    ), "changing the reinjected mode token did not affect any downstream score"
+
+
+def test_unknown_readout_is_rejected(emitted):
+    from tutokana.rail import grid_supports
+
+    model, collator, sample = emitted
+    batch = move_batch(collator(sample[:1]), CPU)
+    supports = grid_supports(collator.grid_ids)
+    with pytest.raises(ValueError, match="unknown readout"):
+        emitted_row(model, batch, supports, readout="sample")
+    with pytest.raises(ValueError, match="unknown readout"):
+        score_emitted(model, collator, sample[:1], CPU, bootstrap=False, readout="sample")

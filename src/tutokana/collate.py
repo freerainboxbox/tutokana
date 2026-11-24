@@ -94,10 +94,10 @@ class Collator:
     ):
         """`score_ce` decides whether an emitted score token is trained by cross-entropy.
 
-        True is `--ce-rail`: the token in the text is the thing the model is optimised to put
-        there. False is `--raft-rail`: the token is only a rendering of the grid expectation,
-        and the expectation is what the loss supervises, so leaving the token in the CE mask
-        would train the mode-seeking objective the arm exists to avoid.
+        True is `--ce-std` and `--ce-rail`: the token in the text is the thing the model is
+        optimised to put there. False is `--raft-rail`: the token is only a rendering of the
+        grid expectation, and the expectation is what the loss supervises, so leaving the token
+        in the CE mask would train the mode-seeking objective the arm exists to avoid.
         """
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", processor)
@@ -220,9 +220,9 @@ class Collator:
         determined by the transcript.
 
         An emitted score token is the opposite case: it is the prediction. `score_ce` decides
-        whether cross-entropy supervises it (`--ce-rail`) or whether the grid expectation does
-        (`--raft-rail`, where leaving it here would re-add the mode-seeking term the arm
-        removes).
+        whether cross-entropy supervises it (`--ce-std`, `--ce-rail`) or whether the grid
+        expectation does (`--raft-rail`, where leaving it here would re-add the mode-seeking
+        term the arm removes).
         """
         labels = input_ids.clone()
         masked = sorted(self.register_ids.values())

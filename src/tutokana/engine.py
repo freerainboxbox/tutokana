@@ -34,7 +34,7 @@ from .data import Utterance
 from .losses import LossConfig, composite_loss
 from .metrics import FieldMetrics, field_metrics
 from .progress import Progress, memory_note
-from .rail import grid_supports
+from .rail import READOUTS, grid_supports
 
 logger = get_logger()
 
@@ -175,6 +175,7 @@ def score(
     bootstrap: bool = True,
     progress: "Progress | None" = None,
     interrupt: dict | None = None,
+    readout: str = "expectation",
 ) -> ScoreResult:
     """Score `utterances`, by whichever channel the run's collator describes.
 
@@ -186,6 +187,7 @@ def score(
         return score_emitted(
             model, collator, utterances, device,
             bootstrap=bootstrap, progress=progress, interrupt=interrupt,
+            readout=readout,
         )
     return _score_teacher_forced(
         model, collator, utterances, device,
@@ -261,8 +263,10 @@ _AUDIO_KEYS = ("input_features", "input_features_mask", "mm_token_type_ids", "to
 
 
 @torch.no_grad()
-def emitted_row(model, batch: dict, supports: dict) -> dict[str, torch.Tensor]:
-    """One utterance, scored by grid expectation with every score fed back.
+def emitted_row(
+    model, batch: dict, supports: dict, readout: str = "expectation"
+) -> dict[str, torch.Tensor]:
+    """One utterance, scored on the grid with every emitted score fed back.
 
     The transcript stays teacher-forced and only the score tokens are the model's own. That is
     deliberate: the published protocol fixes the phone sequence, so letting the model write its
@@ -270,12 +274,21 @@ def emitted_row(model, batch: dict, supports: dict) -> dict[str, torch.Tensor]:
     meaning what the baselines mean. The reinjection is still real, because each emitted score
     changes what every later token attends to.
 
+    `readout` selects how a score is read off the restricted grid logits and written back:
+    - `"expectation"` (RAIL, `--ce-rail` / `--raft-rail`): report the grid expectation and
+      reinject the nearest grid token to that expectation.
+    - `"mode"` (`--ce-std`): naive mode-seeking autoregression restricted to the field's grid
+      tokens — pick the argmax grid token, report its value, and reinject that token.
+
     The turn is walked left to right, feeding one segment per trigger — everything up to and
     including that trigger — and the KV cache carries the rest. That is one forward pass per
     score rather than per token, and each pass adds only the one to three tokens between two
     triggers. Scores are read strictly left to right, so each one sits in the context of the
     scores the model actually emitted, never the gold ones.
     """
+    if readout not in READOUTS:
+        raise ValueError(f"unknown readout {readout!r}; expected one of {READOUTS}")
+
     device = batch["input_ids"].device
     ids = batch["input_ids"][0].tolist()
     read = {key: torch.zeros(len(heads)) for key, heads in batch["heads"].items()}
@@ -314,9 +327,14 @@ def emitted_row(model, batch: dict, supports: dict) -> dict[str, torch.Tensor]:
         )
         # Restricted to the grid once, here, so every readout downstream sees one shape.
         grid_logits = support.restrict(outputs.logits[:, -1, :])
-        read[key][row] = support.report(grid_logits)[0].float().cpu()
-        # Snap and write back, so the next segment is conditioned on this score.
-        ids[position + 1] = int(support.snap(support.expectation(grid_logits))[0])
+        if readout == "mode":
+            read[key][row] = support.report_mode(grid_logits)[0].float().cpu()
+            # Mode-seeking autoregression: write the argmax grid token back into the stream.
+            ids[position + 1] = int(support.mode_token(grid_logits)[0])
+        else:
+            read[key][row] = support.report(grid_logits)[0].float().cpu()
+            # Snap and write back, so the next segment is conditioned on this score.
+            ids[position + 1] = int(support.snap(support.expectation(grid_logits))[0])
         cache = outputs.past_key_values
         consumed = position + 1
     return read
@@ -331,8 +349,9 @@ def score_emitted(
     bootstrap: bool = True,
     progress: "Progress | None" = None,
     interrupt: dict | None = None,
+    readout: str = "expectation",
 ) -> ScoreResult:
-    """Score a RAIL/RAFT run: the expectation is reported, the token is only its rendering.
+    """Score an emitted-score run (`--ce-std`, `--ce-rail`, or `--raft-rail`).
 
     One utterance at a time, unlike the teacher-forced path. Reinjection makes the sequence
     sequential, so a batch would have to advance in lockstep across utterances whose triggers
@@ -340,6 +359,8 @@ def score_emitted(
     and change what every later token attends to. Correctness first, and the cache keeps the
     cost near one forward pass per utterance anyway.
     """
+    if readout not in READOUTS:
+        raise ValueError(f"unknown readout {readout!r}; expected one of {READOUTS}")
     model.eval()
     supports = grid_supports(collator.grid_ids)
     collected: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
@@ -348,7 +369,7 @@ def score_emitted(
 
     for utterance in utterances:
         batch = move_batch(collator([utterance]), device)
-        read = emitted_row(model, batch, supports)
+        read = emitted_row(model, batch, supports, readout=readout)
         for key, prediction in read.items():
             # `native`, not `raw`: stress trains and scores on the vote count but reports on
             # the corpus's published 5-10 median, exactly as the head path does.

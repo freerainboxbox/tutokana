@@ -196,7 +196,7 @@ def main() -> None:
             adapter_dir=None if untuned else run_dir / "adapter",
             grid_ids=grid_ids,
             tokenizer=tokenizer,
-            supports=grid_supports(grid_ids) if grid_ids else {},
+            supports=grid_supports(grid_ids) if config.uses_raft else {},
         )
         if untuned:
             run_id = f"{run_id}-UNTUNED"
@@ -211,7 +211,7 @@ def main() -> None:
             stats,
             phones,
             max_length=config.data.max_length,
-            score_ce=config.variant == "ce_rail",
+            score_ce=config.score_ce,
             grid_ids=grid_ids,
         )
         with graceful_interrupt() as interrupt:
@@ -219,8 +219,9 @@ def main() -> None:
                 # Reinjection makes the turn sequential, so there is no batch to size.
                 log.info(
                     "[score] %s: one utterance per pass, transcript teacher-forced, "
-                    "every score emitted and fed back",
+                    "every score emitted and fed back (%s readout)",
                     config.variant,
+                    config.score_readout,
                 )
             with Progress(len(utterances), log, "score", every=10, unit="utt") as bar:
                 result = score(
@@ -229,6 +230,7 @@ def main() -> None:
                     bootstrap=not args.no_bootstrap,
                     progress=bar,
                     interrupt=interrupt,
+                    readout=config.score_readout,
                 )
         if result.partial:
             log.warning(

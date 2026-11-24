@@ -194,9 +194,10 @@ def main() -> None:
         # Registered once here and handed to the collator: under a variant the delta needs the
         # grid rows, and registering twice would only make the id source ambiguous.
         grid_ids = register_grid_tokens(tokenizer) if config.emits_scores else None
-        # The grid supports are the loss's view of the same grid the renderer emits: one
-        # source, so the columns the loss reads are the columns the text carries.
-        supports = grid_supports(grid_ids) if grid_ids else {}
+        # The grid supports are the RAFT loss's view of the same grid the renderer emits: only
+        # `--raft-rail` gathers grid logits during training, so `--ce-std` and `--ce-rail` stay
+        # pure cross-entropy and never pay for a gather they do not use.
+        supports = grid_supports(grid_ids) if config.uses_raft else {}
         # A variant replaces the output channel rather than adding to it. With the scores in
         # the text, a head reading the same field would be a second channel in the same run,
         # and the arm would no longer be the one the README describes.
@@ -252,7 +253,7 @@ def main() -> None:
             stats,
             phones,
             max_length=config.data.max_length,
-            score_ce=config.variant == "ce_rail",
+            score_ce=config.score_ce,
             grid_ids=grid_ids,
         )
 
@@ -266,7 +267,7 @@ def main() -> None:
             reweight_max=config.reweight_max,
             lambda_detect=config.lambda_detect,
             detect_pos_weight=config.detect_pos_weight,
-            lambda_raft=config.lambda_raft,
+            lambda_raft=config.lambda_raft if config.uses_raft else 0.0,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
         buffer = CorrelationBuffer(loss_config.buffer_capacity)
@@ -393,7 +394,8 @@ def main() -> None:
 
                     if config.train.val_every and step % config.train.val_every == 0:
                         result = score(model, collator, val_subset, device,
-                                       batch_size=config.train.batch_size, bootstrap=False)
+                                       batch_size=config.train.batch_size, bootstrap=False,
+                                       readout=config.score_readout)
                         bar.write(f"[val] step {step}  {summarize(result.metrics)}")
                         if run is not None:
                             run.log(wandb_metrics(result.metrics, "val"), step=step)
@@ -432,7 +434,8 @@ def main() -> None:
             # A finished run must leave nothing behind that a later --resume could pick up.
             clear_resume(run_dir)
         result = score(model, collator, val_subset, device,
-                       batch_size=config.train.batch_size, bootstrap=False)
+                       batch_size=config.train.batch_size, bootstrap=False,
+                       readout=config.score_readout)
         log.info("[val] final  %s", summarize(result.metrics))
         log.info("[val] layer mixtures %s", json.dumps(model.heads.mixture_report()))
 

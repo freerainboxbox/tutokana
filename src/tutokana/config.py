@@ -29,13 +29,11 @@ LOG_FORMAT = "%(asctime)s %(levelname).1s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
 #: The output channel a run trains. `heads` reads every score out of a regression head at a
-#: register; the two RAIL/RAFT arms emit one grid token per score and read it off the
-#: next-token distribution instead. See the README section "Ablations & Variants".
-VARIANTS = ("heads", "ce_rail", "raft_rail")
+#: register; the emitted-score arms emit one grid token per score instead — `--ce-std` reads
+#: the argmax token off the grid (naive mode-seeking autoregression), while `--ce-rail` and
+#: `--raft-rail` read the grid expectation. See the README section "Ablations & Variants".
+VARIANTS = ("heads", "ce_std", "ce_rail", "raft_rail")
 
-#: What each variant still needs before it can train. The guard exists because a parsed flag
-#: that nothing reads is worse than no flag: the run would train the head model, record
-#: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
 #: What each variant still needs before it can train. The guard exists because a parsed flag
 #: that nothing reads is worse than no flag: the run would train the head model, record
 #: `variant: ce_rail` in its own `config.json`, and be indistinguishable from a real result.
@@ -91,10 +89,10 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     head_modes: HeadModeConfig = field(default_factory=HeadModeConfig)
-    #: One field, not a boolean per arm: `--ce-rail` and `--raft-rail` are alternatives to
-    #: each other and to the default, so two booleans would accept a run that is both and
-    #: hand `Config.diff` a conflict with no meaning. `choices` is read by the argparse
-    #: binder, which derives `--ce-rail` and `--raft-rail` from the non-default values.
+    #: One field, not a boolean per arm: `--ce-std`, `--ce-rail` and `--raft-rail` are
+    #: alternatives to each other and to the default, so separate booleans would accept
+    #: conflicting arms and hand `Config.diff` a conflict with no meaning. `choices` is read
+    #: by the argparse binder, which derives one flag per non-default value.
     variant: str = field(default="heads", metadata={"choices": VARIANTS})
     model_id: str = "google/gemma-4-12B-it"
     device: str = "auto"
@@ -136,12 +134,13 @@ class Config:
             raise SystemExit(
                 f"unknown variant {self.variant!r}; known variants: {', '.join(VARIANTS)}"
             )
-        # Under `--ce-rail` the emitted token is the only thing carrying a score, and that
-        # token is trained by cross-entropy. Zeroing the text loss would leave the objective
-        # with no score term at all and run for hours doing nothing.
-        if self.variant == "ce_rail" and self.lambda_lm <= 0.0:
+        # Under `--ce-std` and `--ce-rail` the emitted token is the only thing carrying a score,
+        # and that token is trained by cross-entropy. Zeroing the text loss would leave the
+        # objective with no score term at all and run for hours doing nothing.
+        if self.variant in ("ce_std", "ce_rail") and self.lambda_lm <= 0.0:
+            flag = f"--{self.variant.replace('_', '-')}"
             raise SystemExit(
-                "--ce-rail with --lambda-lm 0 trains nothing: cross-entropy on the emitted "
+                f"{flag} with --lambda-lm 0 trains nothing: cross-entropy on the emitted "
                 "score token is the only score supervision that arm has."
             )
         # The mirror case. `--raft-rail` masks the score token out of the text loss on
@@ -157,9 +156,24 @@ class Config:
     def emits_scores(self) -> bool:
         """Whether the scores travel as emitted text. False is the regression-head path.
 
-        Every unimplemented piece keys off this one value, so the arms cannot drift apart.
+        Every emitted-score switch keys off this one value, so the arms cannot drift apart.
         """
         return self.variant != "heads"
+
+    @property
+    def score_ce(self) -> bool:
+        """Whether cross-entropy supervises the emitted score tokens (`--ce-std`, `--ce-rail`)."""
+        return self.variant in ("ce_std", "ce_rail")
+
+    @property
+    def uses_raft(self) -> bool:
+        """Whether the RAFT grid-expectation loss supervises the scores (`--raft-rail`)."""
+        return self.variant == "raft_rail"
+
+    @property
+    def score_readout(self) -> str:
+        """How an emitted-score run reads a score at inference: `"mode"` or `"expectation"`."""
+        return "mode" if self.variant == "ce_std" else "expectation"
 
     def require_implemented(self) -> None:
         """Stop before a run trains something its own flags do not describe."""

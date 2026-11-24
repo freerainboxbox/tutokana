@@ -29,6 +29,10 @@ import torch
 from .data import FIELD_RANGE, STRESS_RATERS
 from .tokens import SCORE_GRID
 
+#: Supported grid readout rules at inference: `"expectation"` (RAIL) or `"mode"` (`--ce-std`,
+#: greedy argmax restricted to the field's grid tokens).
+READOUTS = ("expectation", "mode")
+
 
 @dataclass(frozen=True)
 class GridSupport:
@@ -115,6 +119,28 @@ class GridSupport:
         grid = self._values(values)
         distance = (grid[None, :] - values[:, None]).abs()
         return self.token_ids.to(values.device)[distance.argmin(dim=-1)]
+
+    def mode_token(self, logits: torch.Tensor) -> torch.Tensor:
+        """The highest-logit token on this grid (mode-seeking / greedy decode)."""
+        return self.token_ids.to(logits.device)[logits.argmax(dim=-1)]
+
+    def mode(self, logits: torch.Tensor) -> torch.Tensor:
+        """The grid value of the highest-logit token, on the grid's own scale."""
+        return self._values(logits)[logits.argmax(dim=-1)]
+
+    def report_mode(self, logits: torch.Tensor) -> torch.Tensor:
+        """The argmax grid token on the field's published scale, for `--ce-std`.
+
+        This is `report` evaluated on a point mass at the mode: every field returns the chosen
+        grid value directly, and `word.stress` maps the chosen vote count through the panel
+        majority (`votes >= 3 -> 10`, else `5`) so metrics stay on the published 5/10 scale.
+        """
+        chosen = self.mode(logits)
+        if (self.level, self.field) == ("word", "stress"):
+            low, high = FIELD_RANGE["word", "stress"]
+            majority = STRESS_RATERS // 2 + 1
+            return low + (high - low) * (chosen >= majority).to(chosen.dtype)
+        return chosen
 
 
 def grid_supports(grid_ids: dict[str, int]) -> dict[str, GridSupport]:
