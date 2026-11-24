@@ -48,6 +48,7 @@ from tutokana.reporting import (
     render_snapping,
     render_table,
     render_transcription,
+    write_metrics_csv,
 )
 from tutokana.tokens import register_grid_tokens, register_tokens
 
@@ -80,6 +81,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generative-samples", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--out", default="", help="write per-field predictions to this JSON file")
+    parser.add_argument(
+        "--out-csv", default="",
+        help="write per-field evaluation metrics to this CSV file",
+    )
     parser.add_argument(
         "--no-detection", action="store_true",
         help="skip the detection table. Spearman here is mostly a detection metric: perfect "
@@ -144,6 +149,7 @@ def main() -> None:
     # A run directory records the variant it trained, so evaluating it cannot disagree with it.
     config.require_implemented()
 
+    partial = False
     with cfg.run_logging("eval", run_id) as log:
         log.info("run %s (trained %s)", run_dir, meta.get("completed_at", "?"))
         seed_everything(config.train.seed)
@@ -232,6 +238,7 @@ def main() -> None:
                     interrupt=interrupt,
                     readout=config.score_readout,
                 )
+        partial = result.partial
         if result.partial:
             log.warning(
                 "[score] interrupted after %d/%d utterances — the table below is computed "
@@ -250,6 +257,7 @@ def main() -> None:
         comparison = render_baselines(result.metrics)
         sections = [table, comparison]
 
+        gold_ceilings = {k: spearman_ceiling(v) for k, v in result.gold.items()}
         detection = {}
         if not args.no_detection and not args.lite:
             detection = {
@@ -257,7 +265,7 @@ def main() -> None:
                 for key in result.predictions
             }
             ceilings = {
-                key: (result.metrics[key].spearman, spearman_ceiling(result.gold[key]))
+                key: (result.metrics[key].spearman, gold_ceilings[key])
                 for key in result.predictions
             }
             sections.append(render_detection(detection, ceilings))
@@ -316,19 +324,20 @@ def main() -> None:
                 log.info("%s", line)
 
         if args.out:
-            Path(args.out).write_text(
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
                 json.dumps(
                     {
                         "run_id": run_id,
                         "split": args.split,
+                        "partial": result.partial,
                         "metrics": {
                             k: asdict(v) | {"sigma_ratio": v.sigma_ratio}
                             for k, v in result.metrics.items()
                         },
                         "detection": {k: asdict(v) for k, v in detection.items()},
-                        "spearman_ceiling": {
-                            k: spearman_ceiling(v) for k, v in result.gold.items()
-                        },
+                        "spearman_ceiling": gold_ceilings,
                         "snapped_metrics": {
                             k: asdict(v) | {"sigma_ratio": v.sigma_ratio}
                             for k, v in snapped_metrics.items()
@@ -339,7 +348,25 @@ def main() -> None:
                     indent=2,
                 )
             )
-            log.info("[out] %s", args.out)
+            log.info("[out] %s", out_path)
+
+        if args.out_csv:
+            csv_path = write_metrics_csv(
+                args.out_csv,
+                run_id=run_id,
+                mode=config.variant.replace("_", "-"),
+                seed=config.train.seed,
+                split=args.split,
+                readout=config.score_readout if config.emits_scores else "heads",
+                metrics=result.metrics,
+                detection=detection,
+                spearman_ceilings=gold_ceilings,
+                snapped_metrics=snapped_metrics,
+            )
+            log.info("[out-csv] %s", csv_path)
+
+    if partial:
+        sys.exit(130)
 
 
 if __name__ == "__main__":

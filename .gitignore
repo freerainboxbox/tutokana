@@ -11,6 +11,9 @@ __pycache__/
 # commit to hold its place.
 runs/
 
+# Batch study artefacts (weights, per-run CSVs, study resume metadata, summary tables).
+batch-studies/
+
 # Run logs, for the same reason: they are records of local experiments, not of the code.
 # `run_logging` creates the directory on demand.
 logs/

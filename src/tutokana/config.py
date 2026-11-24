@@ -24,6 +24,7 @@ from .tokens import LEVELS
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 LOG_DIR = PACKAGE_ROOT / "logs"
 RUN_DIR = PACKAGE_ROOT / "runs"
+BATCH_DIR = PACKAGE_ROOT / "batch-studies"
 
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"

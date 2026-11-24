@@ -87,6 +87,10 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--run-id", default="", help="run directory name (default: timestamped)")
+    parser.add_argument(
+        "--run-dir", default="",
+        help="explicit path to a run directory (default: runs/<run_id>)",
+    )
     parser.add_argument("--notes", default="", help="free-text note stored with the run")
     parser.add_argument(
         "--resume", default="", metavar="RUN_ID",
@@ -113,7 +117,7 @@ def main() -> None:
         if args.run_id:
             raise SystemExit("--run-id and --resume are mutually exclusive")
         run_id = args.resume
-        run_dir = cfg.RUN_DIR / run_id
+        run_dir = Path(args.run_dir) if args.run_dir else cfg.RUN_DIR / run_id
         resume_meta, resume_state = load_resume(run_dir)
         saved = cfg.Config.from_dict(resume_meta["config"])
         conflicts = [
@@ -124,13 +128,15 @@ def main() -> None:
         config = saved
     else:
         run_id = args.run_id or cfg.new_run_id("probe" if config.train.probe else "run")
-        run_dir = cfg.RUN_DIR / run_id
+        run_dir = Path(args.run_dir) if args.run_dir else cfg.RUN_DIR / run_id
         conflicts = []
 
     # Checked on the final config, so a resumed run's saved variant is honoured too: a run
     # recorded as a variant this build cannot train must not be continued as something else.
     config.require_implemented()
 
+    resume_hint = f"--resume {run_id}" + (f" --run-dir {run_dir}" if args.run_dir else "")
+    stopped = False
     with cfg.run_logging("train", run_id) as log:
         started = time.time()
         log.info("run %s", run_id)
@@ -335,7 +341,6 @@ def main() -> None:
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
             }
 
-        stopped = False
         bar = Progress(total_steps, log, "train", every=config.train.log_every,
                        unit="step", start_at=step)
         with graceful_interrupt() as interrupt:
@@ -420,7 +425,7 @@ def main() -> None:
                         )
                         bar.write(
                             f"[save] interrupted at epoch {epoch} sample {next_sample} "
-                            f"step {step} — continue with: python train.py --resume {run_id}"
+                            f"step {step} — continue with: python train.py {resume_hint}"
                         )
                         stopped = True
                         break
@@ -456,10 +461,13 @@ def main() -> None:
         )
         log.info(
             "[done] %s in %.1f min%s", run_dir, (time.time() - started) / 60,
-            f" (interrupted — resume with --resume {run_id})" if stopped else "",
+            f" (interrupted — resume with {resume_hint})" if stopped else "",
         )
         if run is not None:
             run.finish()
+
+    if stopped:
+        sys.exit(130)
 
 
 if __name__ == "__main__":

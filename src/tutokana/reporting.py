@@ -7,7 +7,10 @@ transcribed from their sources and are never computed here.
 
 from __future__ import annotations
 
+import csv
+import math
 from dataclasses import dataclass
+from pathlib import Path
 
 from .metrics import FieldMetrics
 
@@ -262,3 +265,136 @@ def render_snapping(raw: dict[str, FieldMetrics], snapped: dict[str, FieldMetric
             f"{_fmt(b.spearman - a.spearman, '+9.3f')}"
         )
     return "\n".join(lines)
+
+
+METRICS_CSV_COLUMNS: tuple[str, ...] = (
+    "run_id",
+    "mode",
+    "seed",
+    "split",
+    "readout",
+    "level",
+    "field",
+    "metric_key",
+    "n",
+    "pearson",
+    "pearson_lo",
+    "pearson_hi",
+    "spearman",
+    "mse",
+    "mae",
+    "pred_mean",
+    "pred_std",
+    "gold_mean",
+    "gold_std",
+    "sigma_ratio",
+    "spearman_ceiling",
+    "detect_positives",
+    "detect_share",
+    "detect_auc",
+    "detect_f1",
+    "detect_precision",
+    "detect_recall",
+    "detect_threshold",
+    "snapped_pearson",
+    "snapped_spearman",
+    "snapped_mse",
+    "snapped_mae",
+)
+
+
+def _csv_num(value: float | int | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    val = float(value)
+    if math.isnan(val):
+        return "nan"
+    return repr(val)
+
+
+def write_metrics_csv(
+    path: Path | str,
+    *,
+    run_id: str,
+    mode: str,
+    seed: int,
+    split: str,
+    readout: str,
+    metrics: dict[str, FieldMetrics],
+    detection: dict | None = None,
+    spearman_ceilings: dict[str, float] | None = None,
+    snapped_metrics: dict[str, FieldMetrics] | None = None,
+) -> Path:
+    """Export one run's evaluation metrics as a flat CSV for independent statistical analysis."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    detection = detection or {}
+    spearman_ceilings = spearman_ceilings or {}
+    snapped_metrics = snapped_metrics or {}
+
+    ordered_keys: list[tuple[str, str]] = [
+        (level, field)
+        for level, field in REPORT_FIELDS
+        if f"{level}.{field}" in metrics
+    ]
+    seen = {f"{level}.{field}" for level, field in ordered_keys}
+    for key in sorted(metrics):
+        if key not in seen:
+            level, _, field = key.partition(".")
+            ordered_keys.append((level, field))
+
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS)
+        writer.writeheader()
+        for level, field in ordered_keys:
+            key = f"{level}.{field}"
+            m = metrics[key]
+            d = detection.get(key)
+            s = snapped_metrics.get(key)
+            writer.writerow(
+                {
+                    "run_id": run_id,
+                    "mode": mode,
+                    "seed": str(seed),
+                    "split": split,
+                    "readout": readout,
+                    "level": level,
+                    "field": field,
+                    "metric_key": key,
+                    "n": _csv_num(m.n),
+                    "pearson": _csv_num(m.pearson),
+                    "pearson_lo": _csv_num(m.pearson_lo),
+                    "pearson_hi": _csv_num(m.pearson_hi),
+                    "spearman": _csv_num(m.spearman),
+                    "mse": _csv_num(m.mse),
+                    "mae": _csv_num(m.mae),
+                    "pred_mean": _csv_num(m.pred_mean),
+                    "pred_std": _csv_num(m.pred_std),
+                    "gold_mean": _csv_num(m.gold_mean),
+                    "gold_std": _csv_num(m.gold_std),
+                    "sigma_ratio": _csv_num(m.sigma_ratio),
+                    "spearman_ceiling": _csv_num(spearman_ceilings.get(key)),
+                    "detect_positives": _csv_num(d.positives if d is not None else None),
+                    "detect_share": _csv_num(d.share if d is not None else None),
+                    "detect_auc": _csv_num(d.auc if d is not None else None),
+                    "detect_f1": _csv_num(d.f1 if d is not None else None),
+                    "detect_precision": _csv_num(d.precision if d is not None else None),
+                    "detect_recall": _csv_num(d.recall if d is not None else None),
+                    "detect_threshold": _csv_num(d.threshold if d is not None else None),
+                    "snapped_pearson": _csv_num(s.pearson if s is not None else None),
+                    "snapped_spearman": _csv_num(s.spearman if s is not None else None),
+                    "snapped_mse": _csv_num(s.mse if s is not None else None),
+                    "snapped_mae": _csv_num(s.mae if s is not None else None),
+                }
+            )
+    return target
+
+
+def read_metrics_csv(path: Path | str) -> list[dict[str, str]]:
+    """Read rows from a per-run metrics CSV written by `write_metrics_csv`."""
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
