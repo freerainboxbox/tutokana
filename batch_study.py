@@ -196,7 +196,8 @@ def _run_subprocess_interruptible(cmd: list[str]) -> tuple[int, bool]:
         else:
             os.write(
                 2,
-                b"\n[batch] second Ctrl-C received - forwarding immediate interrupt...\n",
+                b"\n[batch] another Ctrl-C received - forwarding; the run stops now unless it is "
+                b"mid-checkpoint, in which case it finishes writing first...\n",
             )
 
     signal.signal(signal.SIGINT, handler)

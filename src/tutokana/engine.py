@@ -65,7 +65,9 @@ def graceful_interrupt():
     """Turn Ctrl-C into a flag checked at accumulation boundaries.
 
     Raising mid-window would leave a half-accumulated gradient and an unsaved run; setting a
-    flag lets the current step finish and checkpoint cleanly.
+    flag lets the current step finish and checkpoint cleanly. A second press raises at once,
+    which is safe only because every checkpoint write runs under `deferred_interrupt`: the
+    escape hatch can abandon a step, never a half-written checkpoint.
     """
     state = {"requested": False}
     previous = signal.getsignal(signal.SIGINT)
@@ -76,6 +78,31 @@ def graceful_interrupt():
             raise KeyboardInterrupt
         state["requested"] = True
         logger.warning("interrupt requested — finishing this step, then saving")
+
+    signal.signal(signal.SIGINT, handler)
+    try:
+        yield state
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@contextmanager
+def deferred_interrupt(state: dict | None = None, what: str = "checkpoint"):
+    """Hold every Ctrl-C until the block finishes; record it in `state` instead of raising.
+
+    A checkpoint is several files (adapter, heads, optimizer bundle, resume.json) that only
+    mean something together. A KeyboardInterrupt between two of those writes leaves weights
+    from one step beside the optimizer and data position of an earlier one, and `--resume`
+    would continue from that silently. Inside this block no number of presses can do that:
+    each one only sets `state["requested"]`, and the previous handler — usually
+    `graceful_interrupt`'s, with its second-press escape hatch — returns on exit.
+    """
+    state = state if state is not None else {"requested": False}
+    previous = signal.getsignal(signal.SIGINT)
+
+    def handler(signum, frame):
+        state["requested"] = True
+        logger.warning("interrupt received during the %s — finishing it first", what)
 
     signal.signal(signal.SIGINT, handler)
     try:

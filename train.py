@@ -43,6 +43,7 @@ from tutokana.engine import (
     build_scheduler,
     batches,
     clear_resume,
+    deferred_interrupt,
     graceful_interrupt,
     load_resume,
     move_batch,
@@ -408,21 +409,28 @@ def main() -> None:
 
                     next_sample = consumed + (micro + 1) * config.train.batch_size
 
+                    # Every write below runs under deferred_interrupt: a Ctrl-C mid-save is
+                    # recorded and acted on at this boundary, never allowed to tear the files.
+                    saved_this_step = False
                     if config.train.save_every and step % config.train.save_every == 0:
-                        model.save(run_dir / f"checkpoint-{step}")
-                        model.save(run_dir)
-                        save_resume(
-                            run_dir, meta=resume_snapshot(epoch, next_sample),
-                            optimizer=optimizer, scheduler=scheduler, buffer=buffer,
-                        )
+                        with deferred_interrupt(interrupt):
+                            model.save(run_dir / f"checkpoint-{step}")
+                            model.save(run_dir)
+                            save_resume(
+                                run_dir, meta=resume_snapshot(epoch, next_sample),
+                                optimizer=optimizer, scheduler=scheduler, buffer=buffer,
+                            )
+                        saved_this_step = True
                         bar.write(f"[save] checkpoint-{step} (resumable)")
 
                     if interrupt["requested"]:
-                        model.save(run_dir)
-                        save_resume(
-                            run_dir, meta=resume_snapshot(epoch, next_sample),
-                            optimizer=optimizer, scheduler=scheduler, buffer=buffer,
-                        )
+                        if not saved_this_step:
+                            with deferred_interrupt(interrupt):
+                                model.save(run_dir)
+                                save_resume(
+                                    run_dir, meta=resume_snapshot(epoch, next_sample),
+                                    optimizer=optimizer, scheduler=scheduler, buffer=buffer,
+                                )
                         bar.write(
                             f"[save] interrupted at epoch {epoch} sample {next_sample} "
                             f"step {step} — continue with: python train.py {resume_hint}"
@@ -433,32 +441,42 @@ def main() -> None:
                     break
 
         bar.close()
-        model.save(run_dir)
-        stats.save(run_dir / "target_stats.json")
-        if not stopped:
-            # A finished run must leave nothing behind that a later --resume could pick up.
-            clear_resume(run_dir)
-        result = score(model, collator, val_subset, device,
-                       batch_size=config.train.batch_size, bootstrap=False,
-                       readout=config.score_readout)
-        log.info("[val] final  %s", summarize(result.metrics))
+        # The training loop's handler is gone by now, so without this a single Ctrl-C would
+        # raise in the middle of the final weights or between them and clear_resume.
+        with deferred_interrupt(what="final checkpoint"):
+            model.save(run_dir)
+            stats.save(run_dir / "target_stats.json")
+            if not stopped:
+                # A finished run must leave nothing behind that a later --resume could pick up.
+                clear_resume(run_dir)
+        # Nothing is written during the final validation, but a KeyboardInterrupt here would
+        # still skip config.json and leave a finished run looking failed. Ctrl-C instead
+        # stops scoring at the current batch, and the partial result is reported as such.
+        with deferred_interrupt(what="final validation") as final_interrupt:
+            result = score(model, collator, val_subset, device,
+                           batch_size=config.train.batch_size, bootstrap=False,
+                           readout=config.score_readout, interrupt=final_interrupt)
+        log.info("[val] final%s  %s",
+                 f" (partial: {result.scored}/{len(val_subset)})" if result.partial else "",
+                 summarize(result.metrics))
         log.info("[val] layer mixtures %s", json.dumps(model.heads.mixture_report()))
 
-        save_run_metadata(
-            run_dir,
-            {
-                "run_id": run_id,
-                "config": config.to_dict(),
-                "phones": list(phones),
-                "mix": mix_stats,
-                "steps": step,
-                "interrupted": stopped,
-                "notes": args.notes,
-                "started_at": datetime.fromtimestamp(started).isoformat(timespec="seconds"),
-                "completed_at": datetime.now().isoformat(timespec="seconds"),
-                "duration_s": round(time.time() - started, 1),
-            },
-        )
+        with deferred_interrupt(what="run metadata"):
+            save_run_metadata(
+                run_dir,
+                {
+                    "run_id": run_id,
+                    "config": config.to_dict(),
+                    "phones": list(phones),
+                    "mix": mix_stats,
+                    "steps": step,
+                    "interrupted": stopped,
+                    "notes": args.notes,
+                    "started_at": datetime.fromtimestamp(started).isoformat(timespec="seconds"),
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "duration_s": round(time.time() - started, 1),
+                },
+            )
         log.info(
             "[done] %s in %.1f min%s", run_dir, (time.time() - started) / 60,
             f" (interrupted — resume with {resume_hint})" if stopped else "",

@@ -474,3 +474,57 @@ def test_interrupted_and_resumed_trajectory_is_bit_identical_to_uninterrupted(tm
     assert torch.equal(
         buf_full._targets["utterance.total"], buf_res._targets["utterance.total"]
     )
+
+
+def _press_ctrl_c():
+    """Deliver a real SIGINT to this process; Python runs the handler before returning."""
+    import os
+    import signal
+
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+def test_repeated_ctrl_c_cannot_interrupt_a_checkpoint_write(tmp_path):
+    """Any number of presses mid-save is recorded, never raised, and the bundle completes."""
+    import signal
+
+    from tutokana.engine import deferred_interrupt, graceful_interrupt
+
+    _, optimizer, scheduler = _optimizer_and_scheduler(Config())
+    with graceful_interrupt() as interrupt:
+        _press_ctrl_c()  # the first press: finish the step, then save
+        assert interrupt["requested"]
+        with deferred_interrupt(interrupt):
+            _press_ctrl_c()  # would be graceful_interrupt's raise-now press
+            _press_ctrl_c()
+            save_resume(tmp_path, meta={"step": 7}, optimizer=optimizer,
+                        scheduler=scheduler, buffer=None)
+        meta, state = load_resume(tmp_path)
+        assert meta["step"] == 7 and state["optimizer"] is not None
+        # The escape hatch is back once the write is done.
+        with pytest.raises(KeyboardInterrupt):
+            _press_ctrl_c()
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_ctrl_c_during_a_periodic_save_requests_a_stop():
+    """A press that lands mid-save must not be lost: the loop has to stop after it."""
+    from tutokana.engine import deferred_interrupt, graceful_interrupt
+
+    with graceful_interrupt() as interrupt:
+        with deferred_interrupt(interrupt):
+            _press_ctrl_c()
+        assert interrupt["requested"]
+
+
+def test_deferred_interrupt_shields_writes_outside_the_training_loop():
+    """The final checkpoint runs after graceful_interrupt has exited; it needs its own guard."""
+    import signal
+
+    from tutokana.engine import deferred_interrupt
+
+    with deferred_interrupt(what="final checkpoint") as state:
+        _press_ctrl_c()
+        _press_ctrl_c()
+    assert state["requested"]
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
