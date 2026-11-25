@@ -7,6 +7,7 @@ evaluated from one `ce` training run; the training runs per round are `heads`, `
     python batch_study.py --prefix alpha --seeds 42,43,44,45,46
     python batch_study.py --prefix alpha --seeds 42,43 --no-ce-std
     python batch_study.py --resume --prefix alpha
+    python batch_study.py --mark-abandoned --prefix alpha
     python batch_study.py --purge --prefix alpha
 
 Each training run is named `<prefix>_<train-mode>_<round>_<seed>` (1-based round, e.g.
@@ -106,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="delete a batch study's artifacts and resume metadata after confirmation "
         "(requires --prefix <prefix>)",
+    )
+    parser.add_argument(
+        "--mark-abandoned",
+        action="store_true",
+        help="mark a study as abandoned (unresumable, finished but not complete, artifacts kept; "
+        "requires --prefix <prefix>)",
     )
     for mode in MODES:
         parser.add_argument(
@@ -344,6 +351,8 @@ def _describe_study_status(study_dir: Path) -> str:
     runs = state.get("runs", [])
     done = sum(1 for r in runs if r.get("status") == "completed")
     total = len(runs)
+    if raw_status == "abandoned":
+        return f"abandoned ({done}/{total} runs completed; finished, not complete)"
     if raw_status == "completed" and not paused_runs:
         return f"finished ({done}/{total} runs completed)"
 
@@ -353,6 +362,67 @@ def _describe_study_status(study_dir: Path) -> str:
     if paused_runs:
         details.append(f"paused checkpoint(s): {', '.join(paused_runs)}")
     return f"still in progress ({'; '.join(details)})"
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("", flush=True)
+        return False
+    return answer in ("y", "yes")
+
+
+def _mark_study_abandoned_state(study_dir: Path, state: dict) -> None:
+    state["status"] = "abandoned"
+    state["abandoned_at"] = datetime.now().isoformat(timespec="seconds")
+    save_study_state(study_dir, state)
+
+
+def _mark_abandoned(prefix_arg: str, batch_root: Path) -> Path:
+    if not prefix_arg:
+        existing = (
+            sorted(p.name for p in batch_root.iterdir() if p.is_dir())
+            if batch_root.exists()
+            else []
+        )
+        hint = f"\nExisting studies: {', '.join(existing)}" if existing else ""
+        raise SystemExit(
+            f"You must specify --prefix <prefix> when using --mark-abandoned.{hint}"
+        )
+    prefix = validate_prefix(prefix_arg)
+    study_dir = batch_root / prefix
+    if not (study_dir / STUDY_STATE_FILE).exists():
+        raise SystemExit(
+            f"No batch study found for prefix {prefix!r} under {batch_root}."
+        )
+    state = load_study_state(study_dir)
+    status = state.get("status")
+    if status == "completed":
+        raise SystemExit(
+            f"Batch study {prefix!r} is already completed; cannot mark a completed study as abandoned."
+        )
+    if status == "abandoned":
+        print(
+            f"[batch] study {prefix!r} is already marked as abandoned "
+            f"({study_dir / STUDY_STATE_FILE}).",
+            flush=True,
+        )
+        return study_dir
+
+    _mark_study_abandoned_state(study_dir, state)
+    done = sum(1 for r in state.get("runs", []) if r.get("status") == "completed")
+    total = len(state.get("runs", []))
+    print(
+        f"[batch] marked batch study {prefix!r} as abandoned "
+        f"({done}/{total} runs completed; finished but not complete; artifacts kept).",
+        flush=True,
+    )
+    print(
+        f"[batch] study {prefix!r} is now unresumable by default; new batch studies are unblocked.",
+        flush=True,
+    )
+    return study_dir
 
 
 def _purge_study(prefix_arg: str, batch_root: Path) -> Path:
@@ -413,10 +483,21 @@ def run_batch_study(
     soc_reader = read_soc if read_soc is not None else read_battery_soc
     min_battery_soc = BATTERY_PAUSE_SOC if is_mac_host() else 0
 
-    if args.purge and args.resume:
-        raise SystemExit("--purge and --resume are mutually exclusive")
+    actions = [
+        flag
+        for flag, active in (
+            ("--purge", args.purge),
+            ("--resume", args.resume),
+            ("--mark-abandoned", args.mark_abandoned),
+        )
+        if active
+    ]
+    if len(actions) > 1:
+        raise SystemExit(f"{' and '.join(actions)} are mutually exclusive")
     if args.purge:
         return _purge_study(args.prefix, batch_root)
+    if args.mark_abandoned:
+        return _mark_abandoned(args.prefix, batch_root)
 
     paused = find_paused_studies(batch_root)
 
@@ -444,6 +525,47 @@ def run_batch_study(
                 f"Batch study {prefix!r} is already completed ({study_dir / STUDY_STATE_FILE}); "
                 "there is nothing to resume."
             )
+        if state.get("status") == "abandoned":
+            done = sum(1 for r in state.get("runs", []) if r.get("status") == "completed")
+            total = len(state.get("runs", []))
+            when = state.get("abandoned_at") or "unknown time"
+            print(
+                f"[batch] WARNING: study {prefix!r} is marked as abandoned "
+                f"({done}/{total} runs completed, abandoned at {when}).",
+                flush=True,
+            )
+            if not _confirm(f"Unabandon and resume batch study {prefix!r}? [y/N] "):
+                print("[batch] resume cancelled.", flush=True)
+                return study_dir
+
+            other_paused = [item for item in paused if item["prefix"] != prefix]
+            if other_paused:
+                names = ", ".join(repr(item["prefix"]) for item in other_paused)
+                plural = "studies" if len(other_paused) > 1 else "study"
+                print(
+                    "[batch] WARNING: another batch study is currently paused or in progress:\n"
+                    f"{_format_paused_list(other_paused)}",
+                    flush=True,
+                )
+                if not _confirm(
+                    f"Mark paused {plural} {names} as abandoned to resume {prefix!r}? [y/N] "
+                ):
+                    print("[batch] resume cancelled.", flush=True)
+                    return study_dir
+                for item in other_paused:
+                    other_dir = item["study_dir"]
+                    other_state = load_study_state(other_dir)
+                    _mark_study_abandoned_state(other_dir, other_state)
+                    print(
+                        f"[batch] marked paused study {item['prefix']!r} as abandoned.",
+                        flush=True,
+                    )
+
+            state["abandoned_at"] = None
+            state["paused_at"] = None
+            state["status"] = "in_progress"
+            save_study_state(study_dir, state)
+            print(f"[batch] unabandoned study {prefix!r}.", flush=True)
 
         # Warn and ignore conflicting CLI flags on resume, mirroring `train.py --resume`.
         if args.seeds:
@@ -476,9 +598,10 @@ def run_batch_study(
         if paused:
             raise SystemExit(
                 "WARNING: A previous batch study is still in progress or paused. "
-                "Cannot start a new batch study until it is resumed and finished.\n"
+                "Cannot start a new batch study until it is resumed, finished, or marked abandoned.\n"
                 f"{_format_paused_list(paused)}\n"
-                "Specify `python batch_study.py --resume --prefix <prefix>` to continue."
+                "Specify `python batch_study.py --resume --prefix <prefix>` to continue, or "
+                "`python batch_study.py --mark-abandoned --prefix <prefix>` to keep it archived."
             )
         prefix = validate_prefix(args.prefix)
         if not args.seeds:

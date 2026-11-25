@@ -1102,3 +1102,185 @@ def test_min_battery_soc_is_accepted_by_train_and_owned_by_batch_study(monkeypat
 
     with pytest.raises(SystemExit, match="managed by batch_study.py"):
         batch_study.parse_args(["--prefix", "a", "--seeds", "1", "--min-battery-soc", "50"])
+
+
+# --- --mark-abandoned and unabandon-on-resume tests -----------------------------------
+
+
+def test_mark_abandoned_validation_and_completed_guard(tmp_path):
+    with pytest.raises(SystemExit, match="must specify --prefix"):
+        batch_study.run_batch_study(["--mark-abandoned"], batch_root=tmp_path)
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        batch_study.run_batch_study(
+            ["--mark-abandoned", "--resume", "--prefix", "alpha"], batch_root=tmp_path
+        )
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        batch_study.run_batch_study(
+            ["--mark-abandoned", "--purge", "--prefix", "alpha"], batch_root=tmp_path
+        )
+    with pytest.raises(SystemExit, match="No batch study found"):
+        batch_study.run_batch_study(["--mark-abandoned", "--prefix", "missing"], batch_root=tmp_path)
+
+    done_dir = tmp_path / "done"
+    done_state = new_study_state(
+        prefix="done", seeds=[12], modes=["heads"], excluded_modes=["ce-std", "ce-rail", "raft-rail"],
+        split="test", eval_batch_size=2, eval_limit=0, no_bootstrap=False, snap=False,
+        extra_train_args=[],
+    )
+    done_state["status"] = "completed"
+    save_study_state(done_dir, done_state)
+    with pytest.raises(SystemExit, match="already completed"):
+        batch_study.run_batch_study(["--mark-abandoned", "--prefix", "done"], batch_root=tmp_path)
+
+
+def test_mark_abandoned_preserves_artifacts_and_unblocks_new_study(tmp_path, capsys):
+    fake_train, fake_eval, _ = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    alpha_dir = batch_root / "alpha"
+    alpha_state = new_study_state(
+        prefix="alpha", seeds=[12, 17], modes=["heads"],
+        excluded_modes=["ce-std", "ce-rail", "raft-rail"],
+        split="test", eval_batch_size=2, eval_limit=0, no_bootstrap=False, snap=False,
+        extra_train_args=[],
+    )
+    alpha_state["status"] = "paused"
+    alpha_state["current_run_id"] = "alpha_heads_2_17"
+    alpha_state["runs"][0]["status"] = "completed"
+    save_study_state(alpha_dir, alpha_state)
+    # Simulate a leftover resume.json from Ctrl-C; it must stay intact yet not block new studies.
+    run_dir = alpha_dir / "runs" / "alpha_heads_2_17"
+    run_dir.mkdir(parents=True)
+    (run_dir / "resume.json").write_text('{"step": 500}', encoding="utf-8")
+
+    assert len(find_paused_studies(batch_root)) == 1
+
+    batch_study.run_batch_study(["--mark-abandoned", "--prefix", "alpha"], batch_root=batch_root)
+    out = capsys.readouterr().out
+    assert "marked batch study 'alpha' as abandoned" in out
+
+    reloaded = load_study_state(alpha_dir)
+    assert reloaded["status"] == "abandoned"
+    assert reloaded["abandoned_at"] is not None
+    assert (run_dir / "resume.json").exists()
+    assert find_paused_studies(batch_root) == []
+    assert "abandoned" in batch_study._describe_study_status(alpha_dir)
+
+    # A new study prefix is now allowed to start and complete.
+    beta_dir = batch_study.run_batch_study(
+        ["--prefix", "beta", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    assert load_study_state(beta_dir)["status"] == "completed"
+
+
+def test_resume_abandoned_study_prompts_to_unabandon(tmp_path, monkeypatch, capsys):
+    fake_train, fake_eval, _ = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    alpha_dir = batch_root / "alpha"
+    alpha_state = new_study_state(
+        prefix="alpha", seeds=[12], modes=["heads"],
+        excluded_modes=["ce-std", "ce-rail", "raft-rail"],
+        split="test", eval_batch_size=2, eval_limit=0, no_bootstrap=False, snap=False,
+        extra_train_args=[],
+    )
+    alpha_state["status"] = "abandoned"
+    alpha_state["abandoned_at"] = "2026-11-25T14:50:00"
+    save_study_state(alpha_dir, alpha_state)
+
+    # Default / 'n' cancels and keeps the study abandoned.
+    monkeypatch.setattr("builtins.input", lambda _p: "")
+    batch_study.run_batch_study(
+        ["--resume", "--prefix", "alpha"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    out = capsys.readouterr().out
+    assert "WARNING: study 'alpha' is marked as abandoned" in out
+    assert "resume cancelled" in out
+    assert load_study_state(alpha_dir)["status"] == "abandoned"
+
+    # Confirming with 'y' unabands and completes the study.
+    monkeypatch.setattr("builtins.input", lambda _p: "y")
+    batch_study.run_batch_study(
+        ["--resume", "--prefix", "alpha"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    out = capsys.readouterr().out
+    assert "unabandoned study 'alpha'" in out
+    final = load_study_state(alpha_dir)
+    assert final["status"] == "completed"
+    assert final["abandoned_at"] is None
+
+
+def test_resume_abandoned_study_while_another_paused_confirms_abandoning_paused(
+    tmp_path, monkeypatch, capsys
+):
+    fake_train, fake_eval, _ = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    alpha_dir = batch_root / "alpha"
+    alpha_state = new_study_state(
+        prefix="alpha", seeds=[12], modes=["heads"],
+        excluded_modes=["ce-std", "ce-rail", "raft-rail"],
+        split="test", eval_batch_size=2, eval_limit=0, no_bootstrap=False, snap=False,
+        extra_train_args=[],
+    )
+    alpha_state["status"] = "abandoned"
+    alpha_state["abandoned_at"] = "2026-11-25T14:50:00"
+    save_study_state(alpha_dir, alpha_state)
+
+    beta_dir = batch_root / "beta"
+    beta_state = new_study_state(
+        prefix="beta", seeds=[12], modes=["heads"],
+        excluded_modes=["ce-std", "ce-rail", "raft-rail"],
+        split="test", eval_batch_size=2, eval_limit=0, no_bootstrap=False, snap=False,
+        extra_train_args=[],
+    )
+    beta_state["status"] = "paused"
+    beta_state["current_run_id"] = "beta_heads_1_12"
+    save_study_state(beta_dir, beta_state)
+
+    # Confirm unabandon alpha ('y'), decline abandoning paused beta ('n') -> atomic cancel.
+    answers = iter(["y", "n"])
+    prompts: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda p: (prompts.append(p), next(answers))[1])
+    batch_study.run_batch_study(
+        ["--resume", "--prefix", "alpha"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    out = capsys.readouterr().out
+    assert len(prompts) == 2
+    assert "Unabandon" in prompts[0]
+    assert "'beta'" in prompts[1] and "abandoned" in prompts[1]
+    assert "resume cancelled" in out
+    assert load_study_state(alpha_dir)["status"] == "abandoned"
+    assert load_study_state(beta_dir)["status"] == "paused"
+
+    # Confirm both ('y', 'y') -> beta becomes abandoned, alpha unabands and completes.
+    answers = iter(["y", "y"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+    batch_study.run_batch_study(
+        ["--resume", "--prefix", "alpha"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    out = capsys.readouterr().out
+    assert "marked paused study 'beta' as abandoned" in out
+    assert load_study_state(beta_dir)["status"] == "abandoned"
+    assert load_study_state(beta_dir)["abandoned_at"] is not None
+    assert load_study_state(alpha_dir)["status"] == "completed"

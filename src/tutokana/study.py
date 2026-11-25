@@ -166,6 +166,7 @@ def new_study_state(
         "created_at": now,
         "updated_at": now,
         "paused_at": None,
+        "abandoned_at": None,
         "completed_at": None,
         "seeds": list(seeds),
         "modes": list(modes),
@@ -229,6 +230,8 @@ def find_paused_studies(batch_root: Path) -> list[dict]:
             except json.JSONDecodeError:
                 state = {"prefix": study_dir.name, "status": "corrupted"}
             status = state.get("status", "unknown")
+            if status == "abandoned":
+                continue
             if status != "completed" or paused_run_ids:
                 found.append(
                     {
