@@ -70,6 +70,7 @@ from tutokana.model import (
     save_run_metadata,
 )
 from tutokana.prompting import TargetSpec
+from tutokana.power import BATTERY_EXIT_CODE, read_battery_soc
 from tutokana.rail import grid_supports
 from tutokana.progress import Progress, memory_note
 from tutokana.reporting import wandb_metrics
@@ -97,6 +98,11 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
         "--resume", default="", metavar="RUN_ID",
         help="continue an interrupted run. Every other setting comes from its resume.json; "
              "conflicting flags are named and ignored rather than silently applied",
+    )
+    parser.add_argument(
+        "--min-battery-soc", type=int, default=0, metavar="PCT",
+        help="macOS only: gracefully pause and checkpoint after any step if battery SoC "
+             "drops below this percentage (0 = disabled)",
     )
     cfg.add_config_arguments(parser)
     args = parser.parse_args()
@@ -138,6 +144,7 @@ def main() -> None:
 
     resume_hint = f"--resume {run_id}" + (f" --run-dir {run_dir}" if args.run_dir else "")
     stopped = False
+    battery_paused = False
     with cfg.run_logging("train", run_id) as log:
         started = time.time()
         log.info("run %s", run_id)
@@ -423,7 +430,17 @@ def main() -> None:
                         saved_this_step = True
                         bar.write(f"[save] checkpoint-{step} (resumable)")
 
-                    if interrupt["requested"]:
+                    low_battery_soc = None
+                    if (
+                        not interrupt["requested"]
+                        and args.min_battery_soc > 0
+                        and step < total_steps
+                    ):
+                        soc = read_battery_soc()
+                        if soc is not None and soc < args.min_battery_soc:
+                            low_battery_soc = soc
+
+                    if interrupt["requested"] or low_battery_soc is not None:
                         if not saved_this_step:
                             with deferred_interrupt(interrupt):
                                 model.save(run_dir)
@@ -431,10 +448,18 @@ def main() -> None:
                                     run_dir, meta=resume_snapshot(epoch, next_sample),
                                     optimizer=optimizer, scheduler=scheduler, buffer=buffer,
                                 )
-                        bar.write(
-                            f"[save] interrupted at epoch {epoch} sample {next_sample} "
-                            f"step {step} — continue with: python train.py {resume_hint}"
-                        )
+                        if low_battery_soc is not None and not interrupt["requested"]:
+                            bar.write(
+                                f"[battery] SoC dropped to {low_battery_soc}% "
+                                f"(< {args.min_battery_soc}%) at epoch {epoch} sample "
+                                f"{next_sample} step {step} — pausing gracefully"
+                            )
+                            battery_paused = True
+                        else:
+                            bar.write(
+                                f"[save] interrupted at epoch {epoch} sample {next_sample} "
+                                f"step {step} — continue with: python train.py {resume_hint}"
+                            )
                         stopped = True
                         break
                 if stopped:
@@ -449,17 +474,20 @@ def main() -> None:
             if not stopped:
                 # A finished run must leave nothing behind that a later --resume could pick up.
                 clear_resume(run_dir)
-        # Nothing is written during the final validation, but a KeyboardInterrupt here would
-        # still skip config.json and leave a finished run looking failed. Ctrl-C instead
-        # stops scoring at the current batch, and the partial result is reported as such.
-        with deferred_interrupt(what="final validation") as final_interrupt:
-            result = score(model, collator, val_subset, device,
-                           batch_size=config.train.batch_size, bootstrap=False,
-                           readout=config.score_readout, interrupt=final_interrupt)
-        log.info("[val] final%s  %s",
-                 f" (partial: {result.scored}/{len(val_subset)})" if result.partial else "",
-                 summarize(result.metrics))
-        log.info("[val] layer mixtures %s", json.dumps(model.heads.mixture_report()))
+        # Skip the final validation pass on a low-battery pause so the GPU releases at once
+        # rather than burning more power before recharging.
+        if not battery_paused:
+            # Nothing is written during the final validation, but a KeyboardInterrupt here would
+            # still skip config.json and leave a finished run looking failed. Ctrl-C instead
+            # stops scoring at the current batch, and the partial result is reported as such.
+            with deferred_interrupt(what="final validation") as final_interrupt:
+                result = score(model, collator, val_subset, device,
+                               batch_size=config.train.batch_size, bootstrap=False,
+                               readout=config.score_readout, interrupt=final_interrupt)
+            log.info("[val] final%s  %s",
+                     f" (partial: {result.scored}/{len(val_subset)})" if result.partial else "",
+                     summarize(result.metrics))
+            log.info("[val] layer mixtures %s", json.dumps(model.heads.mixture_report()))
 
         with deferred_interrupt(what="run metadata"):
             save_run_metadata(
@@ -482,11 +510,15 @@ def main() -> None:
             )
         log.info(
             "[done] %s in %.1f min%s", run_dir, (time.time() - started) / 60,
-            f" (interrupted — resume with {resume_hint})" if stopped else "",
+            " (paused for low battery)" if battery_paused
+            else f" (interrupted — resume with {resume_hint})" if stopped
+            else "",
         )
         if run is not None:
             run.finish()
 
+    if battery_paused:
+        sys.exit(BATTERY_EXIT_CODE)
     if stopped:
         sys.exit(130)
 

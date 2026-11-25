@@ -31,6 +31,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +41,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from tutokana import config as cfg
 from tutokana.engine import RESUME_META
+from tutokana.power import (
+    BATTERY_EXIT_CODE,
+    BATTERY_PAUSE_SOC,
+    BATTERY_POLL_SECONDS,
+    BATTERY_RESUME_SOC,
+    is_mac_host,
+    read_battery_soc,
+    wait_for_battery,
+)
 from tutokana.study import (
     EVAL_VARIANT,
     MODE_TO_FLAG,
@@ -66,6 +77,7 @@ _BATCH_CONTROLLED_TRAIN_FLAGS = frozenset(
         "--ce-std",
         "--ce-rail",
         "--raft-rail",
+        "--min-battery-soc",
     }
 )
 
@@ -249,7 +261,10 @@ def _train_command(
     mode: str,
     seed: int,
     extra_train_args: list[str],
+    *,
+    min_battery_soc: int = 0,
 ) -> list[str]:
+    battery_flags = ["--min-battery-soc", str(min_battery_soc)] if min_battery_soc > 0 else []
     if (run_dir / RESUME_META).exists():
         return [
             sys.executable,
@@ -258,6 +273,7 @@ def _train_command(
             run_id,
             "--run-dir",
             str(run_dir),
+            *battery_flags,
         ]
     return [
         sys.executable,
@@ -269,6 +285,7 @@ def _train_command(
         "--train-seed",
         str(seed),
         *MODE_TO_FLAG[mode],
+        *battery_flags,
         *extra_train_args,
     ]
 
@@ -385,11 +402,16 @@ def run_batch_study(
     batch_root: Path | None = None,
     train_script: Path | None = None,
     eval_script: Path | None = None,
+    read_soc: Callable[[], int | None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    battery_poll_seconds: float = BATTERY_POLL_SECONDS,
 ) -> Path:
     args, extra_train_args = parse_args(argv)
     batch_root = Path(batch_root) if batch_root is not None else cfg.BATCH_DIR
     train_script = Path(train_script) if train_script is not None else ROOT / "train.py"
     eval_script = Path(eval_script) if eval_script is not None else ROOT / "evaluate.py"
+    soc_reader = read_soc if read_soc is not None else read_battery_soc
+    min_battery_soc = BATTERY_PAUSE_SOC if is_mac_host() else 0
 
     if args.purge and args.resume:
         raise SystemExit("--purge and --resume are mutually exclusive")
@@ -522,7 +544,7 @@ def run_batch_study(
             entry["status"] = "trained"
 
         # --- training phase -----------------------------------------------------------
-        if entry["status"] in ("pending", "training"):
+        while entry["status"] in ("pending", "training"):
             resuming_run = (run_dir / RESUME_META).exists()
             action = "resuming training" if resuming_run else "training"
             print(
@@ -536,7 +558,13 @@ def run_batch_study(
             save_study_state(study_dir, state)
 
             cmd = _train_command(
-                train_script, run_id, run_dir, mode, seed, state.get("extra_train_args", [])
+                train_script,
+                run_id,
+                run_dir,
+                mode,
+                seed,
+                state.get("extra_train_args", []),
+                min_battery_soc=min_battery_soc,
             )
             rc, interrupted = _run_subprocess_interruptible(cmd)
 
@@ -552,7 +580,29 @@ def run_batch_study(
                         f"interrupted after training finished for {run_id}",
                         code=130,
                     )
-            elif interrupted or rc == 130 or (run_dir / RESUME_META).exists():
+                break
+            if rc == BATTERY_EXIT_CODE and not interrupted and (run_dir / RESUME_META).exists():
+                entry["status"] = "training"
+                entry["resumable"] = True
+                save_study_state(study_dir, state)
+                try:
+                    wait_for_battery(
+                        min_soc=BATTERY_RESUME_SOC,
+                        poll_seconds=battery_poll_seconds,
+                        read_soc=soc_reader,
+                        sleep=sleep,
+                        reason=f"low battery pause during {run_id}",
+                    )
+                except KeyboardInterrupt:
+                    _pause_and_exit(
+                        study_dir,
+                        state,
+                        run_id,
+                        f"interrupted while waiting for battery recharge during {run_id}",
+                        code=130,
+                    )
+                continue
+            if interrupted or rc == 130 or (run_dir / RESUME_META).exists():
                 entry["status"] = "training"
                 entry["resumable"] = (run_dir / RESUME_META).exists()
                 _pause_and_exit(
@@ -562,17 +612,16 @@ def run_batch_study(
                     f"interrupted during training of {run_id}",
                     code=130,
                 )
-            else:
-                entry["status"] = "training"
-                entry["resumable"] = (run_dir / RESUME_META).exists()
-                entry["last_error"] = f"train.py exited with code {rc}"
-                _pause_and_exit(
-                    study_dir,
-                    state,
-                    run_id,
-                    f"train.py failed for {run_id} with exit code {rc}",
-                    code=rc or 1,
-                )
+            entry["status"] = "training"
+            entry["resumable"] = (run_dir / RESUME_META).exists()
+            entry["last_error"] = f"train.py exited with code {rc}"
+            _pause_and_exit(
+                study_dir,
+                state,
+                run_id,
+                f"train.py failed for {run_id} with exit code {rc}",
+                code=rc or 1,
+            )
 
         # --- evaluation phase ---------------------------------------------------------
         if entry["status"] in ("trained", "evaluating"):
@@ -640,6 +689,26 @@ def run_batch_study(
             entry["status"] = "completed"
             entry["last_error"] = None
             save_study_state(study_dir, state)
+
+            remaining = [r for r in state["runs"][idx:] if r["status"] != "completed"]
+            if remaining:
+                try:
+                    wait_for_battery(
+                        min_soc=BATTERY_RESUME_SOC,
+                        poll_seconds=battery_poll_seconds,
+                        read_soc=soc_reader,
+                        sleep=sleep,
+                        reason=f"after {run_id} finished",
+                    )
+                except KeyboardInterrupt:
+                    _pause_and_exit(
+                        study_dir,
+                        state,
+                        remaining[0]["run_id"],
+                        f"interrupted while waiting for battery recharge before "
+                        f"{remaining[0]['run_id']}",
+                        code=130,
+                    )
 
     # --- final aggregation ------------------------------------------------------------
     csv_summary, txt_summary = write_study_summaries(study_dir, state)

@@ -99,6 +99,7 @@ parser.add_argument("--train-seed", type=int, default=3407)
 parser.add_argument("--ce-std", action="store_true")
 parser.add_argument("--ce-rail", action="store_true")
 parser.add_argument("--raft-rail", action="store_true")
+parser.add_argument("--min-battery-soc", type=int, default=0)
 args, extra = parser.parse_known_args()
 
 run_id = args.resume or args.run_id
@@ -120,8 +121,20 @@ with open({str(trace_file)!r}, "a", encoding="utf-8") as fh:
     fh.write(json.dumps({{
         "cmd": "train", "run_id": run_id, "run_dir": str(run_dir),
         "resumed": bool(args.resume), "mode": mode, "seed": args.train_seed,
-        "extra": extra,
+        "min_battery_soc": args.min_battery_soc, "extra": extra,
     }}) + "\\n")
+
+battery_pause_target = os.environ.get("FAKE_BATTERY_PAUSE_RUN_ID", "")
+if battery_pause_target == run_id and not args.resume:
+    from tutokana.power import BATTERY_EXIT_CODE
+    (run_dir / RESUME_META).write_text(json.dumps({{
+        "run_id": run_id, "mode": mode, "seed": args.train_seed, "step": 10
+    }}))
+    (run_dir / RESUME_STATE).write_bytes(b"state")
+    (run_dir / "config.json").write_text(json.dumps({{
+        "run_id": run_id, "interrupted": True, "mode": mode, "seed": args.train_seed
+    }}))
+    sys.exit(BATTERY_EXIT_CODE)
 
 pause_target = os.environ.get("FAKE_PAUSE_RUN_ID", "")
 ready_file = os.environ.get("FAKE_READY_FILE", "")
@@ -450,6 +463,7 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
+        read_soc=lambda: None,
     )
     assert study_dir == batch_root / "alpha"
     assert find_paused_studies(batch_root) == []
@@ -568,6 +582,7 @@ batch_study.run_batch_study(
     batch_root=Path({str(batch_root)!r}),
     train_script=Path({str(fake_train)!r}),
     eval_script=Path({str(fake_eval)!r}),
+    read_soc=lambda: None,
 )
 """,
         encoding="utf-8",
@@ -635,6 +650,7 @@ batch_study.run_batch_study(
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
+        read_soc=lambda: None,
     )
     final_state = load_study_state(study_dir)
     assert final_state["status"] == "completed"
@@ -669,6 +685,7 @@ batch_study.run_batch_study(
     batch_root=Path({str(batch_root)!r}),
     train_script=Path({str(fake_train)!r}),
     eval_script=Path({str(fake_eval)!r}),
+    read_soc=lambda: None,
 )
 """,
         encoding="utf-8",
@@ -713,6 +730,7 @@ batch_study.run_batch_study(
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
+        read_soc=lambda: None,
     )
     events = [json.loads(line) for line in trace_file.read_text().splitlines()]
     assert [e["cmd"] for e in events] == ["train", "eval", "eval"]
@@ -738,6 +756,7 @@ batch_study.run_batch_study(
     batch_root=Path({str(batch_root)!r}),
     train_script=Path({str(fake_train)!r}),
     eval_script=Path({str(fake_eval)!r}),
+    read_soc=lambda: None,
 )
 """,
         encoding="utf-8",
@@ -785,6 +804,7 @@ batch_study.run_batch_study(
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
+        read_soc=lambda: None,
     )
     events = [json.loads(line) for line in trace_file.read_text().splitlines()]
     assert [(e["cmd"], e.get("mode")) for e in events if e["cmd"] == "eval"] == [
@@ -969,3 +989,116 @@ def test_push_wandb_metrics_logs_history_with_monotonic_step(monkeypatch):
         push_wandb_metrics("proj", "dup", None, {"z": 3.0})
     with pytest.raises(LookupError, match="0 runs"):
         push_wandb_metrics("proj", "missing", None, {"z": 3.0})
+
+
+# --- macOS battery SoC guard tests ----------------------------------------------------
+
+
+def test_parse_pmset_soc_and_non_mac_noop(monkeypatch):
+    from tutokana import power
+
+    assert power.parse_pmset_soc(
+        "Now drawing from 'AC Power'\n"
+        " -InternalBattery-0 (id=22610019)\t68%; charging; 16:47 remaining present: true\n"
+    ) == 68
+    assert power.parse_pmset_soc(
+        "Now drawing from 'Battery Power'\n"
+        " -InternalBattery-0 (id=1)\t100%; charged; 0:00 remaining present: true\n"
+    ) == 100
+    assert power.parse_pmset_soc("Now drawing from 'AC Power'\n") is None
+    assert power.parse_pmset_soc("") is None
+
+    monkeypatch.setattr(power.sys, "platform", "linux")
+    assert power.is_mac_host() is False
+    assert power.read_battery_soc() is None
+
+
+def test_wait_for_battery_polls_every_5s_until_80():
+    from tutokana.power import wait_for_battery
+
+    readings = iter([68, 68, 74, 79, 80])
+    sleeps: list[float] = []
+    messages: list[str] = []
+
+    final = wait_for_battery(
+        min_soc=80,
+        poll_seconds=5.0,
+        read_soc=lambda: next(readings),
+        sleep=sleeps.append,
+        reason="after run 1",
+        emit=messages.append,
+    )
+    assert final == 80
+    assert sleeps == [5.0, 5.0, 5.0, 5.0]
+    assert any("68%" in m and "80%" in m for m in messages)
+    assert any("reached 80%" in m for m in messages)
+
+
+def test_batch_study_waits_for_80_between_runs_and_resumes_after_mid_run_battery_pause(
+    tmp_path, monkeypatch
+):
+    fake_train, fake_eval, trace_file = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    monkeypatch.setattr(batch_study, "is_mac_host", lambda: True)
+    monkeypatch.setenv("FAKE_BATTERY_PAUSE_RUN_ID", "beta_heads_1_12")
+
+    # Sequence of SoC queries:
+    # 1. Mid-run pause during beta_heads_1_12 -> 48%, 65%, 80% (then auto-resumes run 1)
+    # 2. After beta_heads_1_12 finishes (before beta_heads_2_17) -> 72%, 81%
+    # 3. After beta_heads_2_17 (last run): no query needed
+    readings = iter([48, 65, 80, 72, 81])
+    sleeps: list[float] = []
+
+    study_dir = batch_study.run_batch_study(
+        [
+            "--prefix", "beta", "--seeds", "12,17",
+            "--no-ce-std", "--no-ce-rail", "--no-raft-rail",
+        ],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: next(readings),
+        sleep=sleeps.append,
+        battery_poll_seconds=5.0,
+    )
+    assert load_study_state(study_dir)["status"] == "completed"
+    # 2 sleeps during mid-run recharge (48->65->80) + 1 sleep between runs (72->81).
+    assert sleeps == [5.0, 5.0, 5.0]
+    assert list(readings) == []
+
+    events = [json.loads(line) for line in trace_file.read_text().splitlines()]
+    trains = [e for e in events if e["cmd"] == "train"]
+    assert [(e["run_id"], e["resumed"], e["min_battery_soc"]) for e in trains] == [
+        ("beta_heads_1_12", False, 50),
+        ("beta_heads_1_12", True, 50),
+        ("beta_heads_2_17", False, 50),
+    ]
+
+
+def test_batch_study_omits_min_battery_soc_on_non_mac_hosts(tmp_path, monkeypatch):
+    fake_train, fake_eval, trace_file = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    monkeypatch.setattr(batch_study, "is_mac_host", lambda: False)
+    batch_study.run_batch_study(
+        ["--prefix", "linuxrun", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail"],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    events = [json.loads(line) for line in trace_file.read_text().splitlines()]
+    trains = [e for e in events if e["cmd"] == "train"]
+    assert trains[0]["min_battery_soc"] == 0
+
+
+def test_min_battery_soc_is_accepted_by_train_and_owned_by_batch_study(monkeypatch):
+    import train
+
+    monkeypatch.setattr("sys.argv", ["train.py", "--min-battery-soc", "50"])
+    args, _ = train.parse_args()
+    assert args.min_battery_soc == 50
+
+    with pytest.raises(SystemExit, match="managed by batch_study.py"):
+        batch_study.parse_args(["--prefix", "a", "--seeds", "1", "--min-battery-soc", "50"])
