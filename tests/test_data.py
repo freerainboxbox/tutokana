@@ -43,6 +43,46 @@ def test_split_rejects_impossible_sizes(utterances):
         speaker_split(utterances, val_speakers=99, seed=0)
 
 
+def test_speaker_split_stratifies_by_age_cohort_and_score_bins():
+    """Validation speakers stay disjoint, balance child/adult cohorts, and span score quantiles."""
+    from dataclasses import replace
+
+    from conftest import make_utterance
+    from tutokana.data import CHILD_MAX_AGE
+
+    # 24 speakers: 12 children (ages 6..15) and 12 adults (ages 19..30), each with 2 utterances
+    # spanning average total scores from 3.0 to 9.6 within both age cohorts.
+    corpus = []
+    idx = 0
+    for cohort, ages in (("c", range(6, 18)), ("a", range(19, 31))):
+        for rank, age in enumerate(ages):
+            spk = f"{cohort}{rank:02d}"
+            # Map age <= CHILD_MAX_AGE for children (clamp 16,17 -> 15) and > CHILD_MAX_AGE for adults.
+            spk_age = min(age, CHILD_MAX_AGE) if cohort == "c" else age
+            score = 3.0 + 0.6 * rank
+            for _ in range(2):
+                corpus.append(replace(make_utterance(idx, speaker=spk), total=score, age=spk_age))
+                idx += 1
+
+    for seed in (42, 0, 7, 17):
+        train, val = speaker_split(corpus, val_speakers=6, seed=seed)
+        train_spks = {u.speaker for u in train}
+        val_spks = {u.speaker for u in val}
+        assert train_spks & val_spks == set()
+        assert len(val_spks) == 6
+        assert len(train) + len(val) == len(corpus)
+
+        # Equal 12/12 cohort sizes -> exactly 3 children and 3 adults in val.
+        val_ages = {u.speaker: u.age for u in val}
+        assert sum(a <= CHILD_MAX_AGE for a in val_ages.values()) == 3
+        assert sum(a > CHILD_MAX_AGE for a in val_ages.values()) == 3
+
+        # Within each cohort, 3 quantile bins (ranks 0..3, 4..7, 8..11) contribute 1 speaker each.
+        for prefix in ("c", "a"):
+            ranks = sorted(int(s[1:]) for s in val_spks if s.startswith(prefix))
+            assert ranks[0] < 4 and 4 <= ranks[1] < 8 and ranks[2] >= 8
+
+
 def test_target_stats_roundtrip(tmp_path, utterances):
     stats = compute_target_stats(utterances)
     path = tmp_path / "stats.json"

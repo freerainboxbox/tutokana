@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import math
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -189,24 +190,30 @@ def wandb_metrics(results: dict[str, FieldMetrics], prefix: str = "eval") -> dic
     return flat
 
 
-def push_wandb_summary(
+def push_wandb_metrics(
     project: str,
     run_name: str,
     wandb_run_id: str | None,
     values: dict[str, float],
+    *,
+    step: int | None = None,
 ) -> str:
-    """Write `values` into an existing W&B run's summary and return that run's id.
+    """Log `values` to an existing W&B run's history (and summary) and return that run's id.
 
-    Goes through the public API rather than `wandb.init(resume=...)`, so a finished training
-    run is annotated in place instead of being reopened as a new session. With no recorded id
-    (runs trained before `config.json` kept it) the run is found by its display name, which
-    must match exactly one run in the project.
+    Resumes the run with `resume="must"` and calls `run.log(...)` rather than updating
+    `run.summary` via the Public API alone: W&B's default workspace charts plot history against
+    `_step`, so summary-only keys render empty panels. Console/code/system capture are disabled
+    and a temporary directory is used so reopening the run leaves training metadata and local
+    `wandb/` state untouched.
+
+    With no recorded id (runs trained before `config.json` kept it) the run is found by its
+    display name, which must match exactly one run in the project.
     """
     import wandb
 
-    api = wandb.Api()
-    base = f"{api.default_entity}/{project}"
     if not wandb_run_id:
+        api = wandb.Api()
+        base = f"{api.default_entity}/{project}"
         matches = list(api.runs(base, filters={"display_name": run_name}))
         if len(matches) != 1:
             raise LookupError(
@@ -214,8 +221,32 @@ def push_wandb_summary(
                 f"{run_name!r} (need exactly one)"
             )
         wandb_run_id = matches[0].id
-    run = api.run(f"{base}/{wandb_run_id}")
-    run.summary.update(values)
+
+    with tempfile.TemporaryDirectory(prefix="wandb-eval-") as tmp_dir:
+        run = wandb.init(
+            project=project,
+            id=wandb_run_id,
+            resume="must",
+            dir=tmp_dir,
+            settings=wandb.Settings(
+                console="off",
+                disable_code=True,
+                disable_git=True,
+                silent=True,
+                x_disable_meta=True,
+                x_disable_stats=True,
+            ),
+        )
+        try:
+            if step is not None:
+                # W&B drops logs with a step below `starting_step`, which happens when a shared
+                # CE run receives a second evaluation pass (ce-std then ce-rail).
+                log_step = max(step, int(getattr(run, "starting_step", 0) or 0))
+                run.log(values, step=log_step, commit=True)
+            else:
+                run.log(values)
+        finally:
+            run.finish()
     return wandb_run_id
 
 

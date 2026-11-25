@@ -883,7 +883,7 @@ def test_purge_reports_finished_status_and_deletes_on_yes(tmp_path, monkeypatch,
 
 
 
-# --- W&B summary of evaluation results ------------------------------------------------
+# --- W&B logging of evaluation results ------------------------------------------------
 
 
 def test_wandb_prefix_separates_the_ce_readouts():
@@ -896,9 +896,19 @@ def test_wandb_prefix_separates_the_ce_readouts():
 
 
 class _FakeRun:
-    def __init__(self, rid):
+    def __init__(self, rid, starting_step=0):
         self.id = rid
-        self.summary = {}
+        self.starting_step = starting_step
+        self.logged: list[tuple[dict, int | None, bool | None]] = []
+        self.finished = False
+
+    def log(self, data, step=None, commit=None):
+        self.logged.append((dict(data), step, commit))
+        next_step = (step if step is not None else self.starting_step) + 1
+        self.starting_step = max(self.starting_step, next_step)
+
+    def finish(self):
+        self.finished = True
 
 
 class _FakeApi:
@@ -910,26 +920,52 @@ class _FakeApi:
         assert path == "me/proj"
         return [self.runs_by_id[r] for r in self.names.get(filters["display_name"], [])]
 
-    def run(self, path):
-        return self.runs_by_id[path.rsplit("/", 1)[1]]
 
-
-def test_push_wandb_summary_uses_recorded_id_or_unique_name(monkeypatch):
+def test_push_wandb_metrics_logs_history_with_monotonic_step(monkeypatch):
     import types
 
-    from tutokana.reporting import push_wandb_summary
+    from tutokana.reporting import push_wandb_metrics
 
-    _FakeApi.runs_by_id = {"a1": _FakeRun("a1"), "b1": _FakeRun("b1"), "b2": _FakeRun("b2")}
+    _FakeApi.runs_by_id = {
+        "a1": _FakeRun("a1", starting_step=1961),
+        "b1": _FakeRun("b1", starting_step=1961),
+        "b2": _FakeRun("b2", starting_step=10),
+    }
     _FakeApi.names = {"alpha_ce_1_12": ["a1"], "dup": ["b1", "b2"]}
-    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Api=_FakeApi))
+    init_calls: list[dict] = []
 
-    assert push_wandb_summary("proj", "ignored", "b1", {"x": 1.0}) == "b1"
-    assert _FakeApi.runs_by_id["b1"].summary == {"x": 1.0}
+    def fake_init(**kwargs):
+        init_calls.append(kwargs)
+        assert kwargs["resume"] == "must"
+        assert Path(kwargs["dir"]).exists()
+        run = _FakeApi.runs_by_id[kwargs["id"]]
+        run.finished = False
+        return run
 
-    assert push_wandb_summary("proj", "alpha_ce_1_12", None, {"y": 2.0}) == "a1"
-    assert _FakeApi.runs_by_id["a1"].summary == {"y": 2.0}
+    fake_wandb = types.SimpleNamespace(
+        Api=_FakeApi,
+        init=fake_init,
+        Settings=lambda **kw: kw,
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    # Recorded id logs at requested step when >= starting_step, and finishes cleanly.
+    assert push_wandb_metrics("proj", "ignored", "b1", {"x": 1.0}, step=1964) == "b1"
+    assert _FakeApi.runs_by_id["b1"].logged == [({"x": 1.0}, 1964, True)]
+    assert _FakeApi.runs_by_id["b1"].finished is True
+    assert init_calls[-1]["settings"]["x_disable_stats"] is True
+    assert init_calls[-1]["settings"]["console"] == "off"
+
+    # Second eval on the same run advances past starting_step instead of dropping step=1964.
+    assert push_wandb_metrics("proj", "ignored", "b1", {"x2": 2.0}, step=1964) == "b1"
+    assert _FakeApi.runs_by_id["b1"].logged[-1] == ({"x2": 2.0}, 1965, True)
+
+    # Missing id falls back to unique display_name lookup and handles step=None.
+    assert push_wandb_metrics("proj", "alpha_ce_1_12", None, {"y": 2.0}) == "a1"
+    assert _FakeApi.runs_by_id["a1"].logged == [({"y": 2.0}, None, None)]
+    assert _FakeApi.runs_by_id["a1"].finished is True
 
     with pytest.raises(LookupError, match="2 runs"):
-        push_wandb_summary("proj", "dup", None, {"z": 3.0})
+        push_wandb_metrics("proj", "dup", None, {"z": 3.0})
     with pytest.raises(LookupError, match="0 runs"):
-        push_wandb_summary("proj", "missing", None, {"z": 3.0})
+        push_wandb_metrics("proj", "missing", None, {"z": 3.0})

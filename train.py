@@ -160,16 +160,16 @@ def main() -> None:
         limit = config.data.limit or None
         full_train = load_split("train", limit=limit)
         train_utterances, val_utterances = speaker_split(
-            full_train, config.data.val_speakers, config.train.seed
+            full_train, config.data.val_speakers, config.data.val_split_seed
         )
         val_subset = [
             val_utterances[i]
             for i in stratified_indices(val_utterances, config.data.val_samples)
         ]
         log.info(
-            "[data] %d train / %d val utterances (%d val speakers held out), scoring on %d",
+            "[data] %d train / %d val utterances (%d val speakers held out, split seed %d), scoring on %d",
             len(train_utterances), len(val_utterances), config.data.val_speakers,
-            len(val_subset),
+            config.data.val_split_seed, len(val_subset),
         )
 
         stats = compute_target_stats(train_utterances)

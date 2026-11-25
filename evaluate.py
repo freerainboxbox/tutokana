@@ -47,7 +47,7 @@ from tutokana.reporting import (
     render_detection,
     render_snapping,
     render_table,
-    push_wandb_summary,
+    push_wandb_metrics,
     render_transcription,
     wandb_metrics,
     write_metrics_csv,
@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-wandb", action="store_true",
-        help="do not write the results into the training run's W&B summary",
+        help="do not log the results to the training run on W&B",
     )
     parser.add_argument(
         "--eval-variant", default="", choices=("", *CE_VARIANTS),
@@ -415,12 +415,16 @@ def main() -> None:
                 values |= wandb_metrics(snapped_metrics, f"{prefix}-snapped")
             # An evaluation that scored correctly must not fail because W&B is unreachable.
             try:
-                wid = push_wandb_summary(
-                    config.train.wandb_project, run_id, meta.get("wandb_run_id"), values
+                wid = push_wandb_metrics(
+                    config.train.wandb_project,
+                    run_id,
+                    meta.get("wandb_run_id"),
+                    values,
+                    step=meta.get("steps"),
                 )
-                log.info("[wandb] wrote %d %s/* values to run %s", len(values), prefix, wid)
+                log.info("[wandb] logged %d %s/* values to run %s", len(values), prefix, wid)
             except Exception as exc:  # noqa: BLE001
-                log.warning("[wandb] could not write results to W&B: %s", exc)
+                log.warning("[wandb] could not log results to W&B: %s", exc)
 
     if partial:
         sys.exit(130)

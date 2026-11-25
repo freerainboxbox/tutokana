@@ -42,6 +42,14 @@ SPLIT_INDEX_URL = _CORPUS_RAW + "/{split}/text"
 #: p of 0.947, hence nu = p*(1-p)/Var(p) - 1 = 8.63. Held fixed; see README.
 STRESS_CONCENTRATION = 8.6
 
+#: Default fixed seed for the train/validation speaker split, decoupled from the training seed
+#: so multi-seed runs share one fixed validation split.
+DEFAULT_VAL_SPLIT_SEED = 42
+
+#: Upper age bound for the child cohort in speechocean762, where speakers split cleanly into
+#: children (ages 6-15) and adults (ages 19+).
+CHILD_MAX_AGE = 15
+
 #: Field ranges on their native scales, used for soft-class supports and sanity checks.
 FIELD_RANGE: dict[tuple[str, str], tuple[float, float]] = {
     ("utterance", "accuracy"): (0.0, 10.0),
@@ -117,6 +125,7 @@ class Utterance:
     total: float
     completeness: float
     words: tuple[Word, ...]
+    age: int | None = None
 
     @property
     def duration_s(self) -> float:
@@ -223,6 +232,7 @@ def to_utterance(row: dict, index: int, stress_votes: tuple[int, ...]) -> Uttera
         total=float(row["total"]),
         completeness=float(row["completeness"]),
         words=words,
+        age=int(row["age"]) if row.get("age") is not None else None,
     )
 
 
@@ -245,22 +255,80 @@ def load_split(split: str, limit: int | None = None) -> list[Utterance]:
     return [to_utterance(raw[i], i, votes[i]) for i in range(n)]
 
 
-def speaker_split(
-    utterances: list[Utterance], val_speakers: int, seed: int
-) -> tuple[list[Utterance], list[Utterance]]:
-    """Carve a speaker-disjoint validation slice out of a split.
+def _allocate_strata_counts(sizes: list[int], total: int) -> list[int]:
+    """Apportion `total` slots proportionally across strata via largest remainder."""
+    population = sum(sizes)
+    exact = [total * size / population for size in sizes]
+    counts = [min(size, int(quota)) for size, quota in zip(sizes, exact)]
+    remaining = total - sum(counts)
+    order = sorted(
+        range(len(sizes)),
+        key=lambda i: (exact[i] - counts[i], sizes[i]),
+        reverse=True,
+    )
+    for i in order:
+        if remaining <= 0:
+            break
+        if counts[i] < sizes[i]:
+            counts[i] += 1
+            remaining -= 1
+    return counts
 
-    The official train/test division is speaker-disjoint by construction; a validation slice
-    that shares speakers with training would leak speaker identity and read optimistically,
-    which is exactly the mistake that makes a mid-training metric useless.
+
+def speaker_split(
+    utterances: list[Utterance],
+    val_speakers: int,
+    seed: int = DEFAULT_VAL_SPLIT_SEED,
+) -> tuple[list[Utterance], list[Utterance]]:
+    """Carve a speaker-disjoint, stratified validation slice out of a split.
+
+    Speakers never cross between train and val. To keep the validation set representative of
+    the full corpus rather than vulnerable to range restriction, speakers are stratified by
+    age cohort (child ``<= 15`` vs adult ``> 15`` when age metadata spans both) and, within
+    each cohort, partitioned into equal-sized quantile bins by speaker-mean utterance total
+    score. One speaker is drawn uniformly from each ``(age_cohort, score_bin)`` cell using
+    ``seed`` (fixed at 42 by default, decoupled from ``train.seed``).
     """
-    speakers = sorted({u.speaker for u in utterances})
-    if not 0 < val_speakers < len(speakers):
+    by_speaker: dict[str, list[Utterance]] = {}
+    for u in utterances:
+        by_speaker.setdefault(u.speaker, []).append(u)
+
+    if not 0 < val_speakers < len(by_speaker):
         raise ValueError(
-            f"val_speakers must be in (0, {len(speakers)}), got {val_speakers}"
+            f"val_speakers must be in (0, {len(by_speaker)}), got {val_speakers}"
         )
+
+    profiles: list[tuple[float, int | None, str]] = []
+    for speaker in sorted(by_speaker):
+        items = by_speaker[speaker]
+        mean_total = float(np.mean([u.total for u in items]))
+        ages = [u.age for u in items if u.age is not None]
+        age = ages[0] if ages else None
+        profiles.append((mean_total, age, speaker))
+
+    has_all_ages = all(age is not None for _, age, _ in profiles)
+    if has_all_ages:
+        children = [p for p in profiles if p[1] is not None and p[1] <= CHILD_MAX_AGE]
+        adults = [p for p in profiles if p[1] is not None and p[1] > CHILD_MAX_AGE]
+        cohorts = [c for c in (children, adults) if c]
+    else:
+        cohorts = [profiles]
+
+    cohorts = [
+        sorted(cohort, key=lambda p: (p[0], p[1] if p[1] is not None else -1, p[2]))
+        for cohort in cohorts
+    ]
+    allocations = _allocate_strata_counts([len(c) for c in cohorts], val_speakers)
+
     rng = np.random.default_rng(seed)
-    held = set(rng.permutation(np.asarray(speakers))[:val_speakers].tolist())
+    held: set[str] = set()
+    for cohort, count in zip(cohorts, allocations):
+        if count <= 0:
+            continue
+        for bin_indices in np.array_split(np.arange(len(cohort)), count):
+            chosen = int(bin_indices[int(rng.integers(len(bin_indices)))])
+            held.add(cohort[chosen][2])
+
     train = [u for u in utterances if u.speaker not in held]
     val = [u for u in utterances if u.speaker in held]
     return train, val

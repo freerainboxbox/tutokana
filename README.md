@@ -142,7 +142,19 @@ This uses moment matching instead of maximum likelihood because it is closed-for
 
 - The model uses LoRA r=32 α=64 on all attention and MLP projections. The Gemma 4 audio path is encoder-free; it projects a raw 40 ms frame straight into the embedding space. LoRA on language layers acts as the acoustic adapter.
 - The model uses a micro-batch of 1 and gradient accumulation of 4. Activation memory depends only on the micro-batch.
-- Validation uses speakers that are disjoint from training and reports correlation instead of loss. The model never touches the test split during training.
+- Validation uses a fixed, speaker-disjoint, stratified split from the training set and reports correlation instead of loss. The model never touches the test split during training.
+
+### Data splits and speaker stratification
+
+The published `test` split (2,500 utterances, 125 speakers) stays untouched during training and serves as the final evaluation set.
+
+The `train` and `val` splits come from the published `train` split (2,500 utterances, 125 speakers, 20 utterances per speaker) via `speaker_split` in `src/tutokana/data.py`:
+
+- **Fixed split seed (`42`).** `--data-val-split-seed` defaults to `42` and stays separate from `--train-seed`. Multi-seed studies vary model initialization, oversampling mix, epoch shuffle, and dropout while sharing one fixed train/validation partition.
+- **Speaker disjointness.** Every utterance from a given speaker stays together in either `train` or `val`. No speaker appears in both splits.
+- **Age cohorts.** Speechocean762 divides cleanly into children (`age <= 15`, 58 speakers) and adults (`age > 15`, 67 speakers) in the training split. Validation slots apportion proportionally across both cohorts by largest remainder (6 children and 6 adults for `--data-val-speakers 12`).
+- **Average total score bins.** Within each age cohort, `speaker_split` sorts speakers by their mean utterance `total` score (with tie-breaking on age and speaker ID). It then divides each sorted cohort into equal-sized quantile bins, one bin per allocated validation slot (6 child bins and 6 adult bins).
+- **Sampling.** The split draws one speaker uniformly from each `(age cohort, score bin)` cell with the fixed seed `42`. That yields 12 speakers (240 utterances) across both age groups and the full proficiency range, avoiding range restriction in validation correlation.
 
 ### The assistant turn
 

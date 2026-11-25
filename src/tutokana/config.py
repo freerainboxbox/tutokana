@@ -50,6 +50,7 @@ class DataConfig:
     oversample_k: int = 5
     n_negatives: int = 300
     val_speakers: int = 12
+    val_split_seed: int = 42
     val_samples: int = 250
     max_length: int = 2048
     limit: int = 0  # 0 = the whole split

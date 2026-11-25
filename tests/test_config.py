@@ -115,6 +115,14 @@ def test_a_run_recorded_before_variants_exists_resumes_as_heads():
     assert Config.from_dict({"lambda_lm": 0.25}).variant == "heads"
 
 
+def test_val_split_seed_defaults_to_42_and_is_separate_from_train_seed():
+    cfg = _config(["--train-seed", "17"])
+    assert cfg.train.seed == 17
+    assert cfg.data.val_split_seed == 42
+    assert Config.from_dict(_config(["--data-val-split-seed", "99"]).to_dict()).data.val_split_seed == 99
+    assert Config.from_dict({"data": {"val_speakers": 12}}).data.val_split_seed == 42
+
+
 def test_diff_reports_the_variant_so_a_resume_cannot_switch_it_mid_run():
     """`train.py` keeps only conflicts whose path is in the set of typed flags."""
     config = Config()
