@@ -466,6 +466,9 @@ def main() -> None:
                 run_dir,
                 {
                     "run_id": run_id,
+                    # Kept so evaluate.py can attach its results to this run's W&B summary;
+                    # resume.json, which also holds it, is deleted when training finishes.
+                    "wandb_run_id": run.id if run is not None else None,
                     "config": config.to_dict(),
                     "phones": list(phones),
                     "mix": mix_stats,

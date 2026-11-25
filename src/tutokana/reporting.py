@@ -189,6 +189,36 @@ def wandb_metrics(results: dict[str, FieldMetrics], prefix: str = "eval") -> dic
     return flat
 
 
+def push_wandb_summary(
+    project: str,
+    run_name: str,
+    wandb_run_id: str | None,
+    values: dict[str, float],
+) -> str:
+    """Write `values` into an existing W&B run's summary and return that run's id.
+
+    Goes through the public API rather than `wandb.init(resume=...)`, so a finished training
+    run is annotated in place instead of being reopened as a new session. With no recorded id
+    (runs trained before `config.json` kept it) the run is found by its display name, which
+    must match exactly one run in the project.
+    """
+    import wandb
+
+    api = wandb.Api()
+    base = f"{api.default_entity}/{project}"
+    if not wandb_run_id:
+        matches = list(api.runs(base, filters={"display_name": run_name}))
+        if len(matches) != 1:
+            raise LookupError(
+                f"no recorded W&B run id, and {len(matches)} runs in {base} are named "
+                f"{run_name!r} (need exactly one)"
+            )
+        wandb_run_id = matches[0].id
+    run = api.run(f"{base}/{wandb_run_id}")
+    run.summary.update(values)
+    return wandb_run_id
+
+
 #: Fields where more than this share of labels sit below the maximum have no dominant
 #: ceiling, so "detect the imperfect ones" is not a detection problem and F1 is maximised by
 #: calling everything positive.

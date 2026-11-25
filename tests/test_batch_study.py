@@ -881,3 +881,55 @@ def test_purge_reports_finished_status_and_deletes_on_yes(tmp_path, monkeypatch,
     assert "finished (1/1 runs completed)" in out
     assert not study_dir.exists()
 
+
+
+# --- W&B summary of evaluation results ------------------------------------------------
+
+
+def test_wandb_prefix_separates_the_ce_readouts():
+    import evaluate
+
+    assert evaluate.wandb_prefix("test", "heads") == "test"
+    assert evaluate.wandb_prefix("test", "raft_rail") == "test"
+    assert evaluate.wandb_prefix("test", "ce_std") == "test-ce-std"
+    assert evaluate.wandb_prefix("test", "ce_rail") == "test-ce-rail"
+
+
+class _FakeRun:
+    def __init__(self, rid):
+        self.id = rid
+        self.summary = {}
+
+
+class _FakeApi:
+    default_entity = "me"
+    runs_by_id: dict = {}
+    names: dict = {}
+
+    def runs(self, path, filters):
+        assert path == "me/proj"
+        return [self.runs_by_id[r] for r in self.names.get(filters["display_name"], [])]
+
+    def run(self, path):
+        return self.runs_by_id[path.rsplit("/", 1)[1]]
+
+
+def test_push_wandb_summary_uses_recorded_id_or_unique_name(monkeypatch):
+    import types
+
+    from tutokana.reporting import push_wandb_summary
+
+    _FakeApi.runs_by_id = {"a1": _FakeRun("a1"), "b1": _FakeRun("b1"), "b2": _FakeRun("b2")}
+    _FakeApi.names = {"alpha_ce_1_12": ["a1"], "dup": ["b1", "b2"]}
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Api=_FakeApi))
+
+    assert push_wandb_summary("proj", "ignored", "b1", {"x": 1.0}) == "b1"
+    assert _FakeApi.runs_by_id["b1"].summary == {"x": 1.0}
+
+    assert push_wandb_summary("proj", "alpha_ce_1_12", None, {"y": 2.0}) == "a1"
+    assert _FakeApi.runs_by_id["a1"].summary == {"y": 2.0}
+
+    with pytest.raises(LookupError, match="2 runs"):
+        push_wandb_summary("proj", "dup", None, {"z": 3.0})
+    with pytest.raises(LookupError, match="0 runs"):
+        push_wandb_summary("proj", "missing", None, {"z": 3.0})

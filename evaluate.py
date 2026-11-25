@@ -47,7 +47,9 @@ from tutokana.reporting import (
     render_detection,
     render_snapping,
     render_table,
+    push_wandb_summary,
     render_transcription,
+    wandb_metrics,
     write_metrics_csv,
 )
 from tutokana.tokens import register_grid_tokens, register_tokens
@@ -98,6 +100,10 @@ def parse_args() -> argparse.Namespace:
              "correlation is comparing against. Applied after the fact, no retraining",
     )
     parser.add_argument(
+        "--no-wandb", action="store_true",
+        help="do not write the results into the training run's W&B summary",
+    )
+    parser.add_argument(
         "--eval-variant", default="", choices=("", *CE_VARIANTS),
         help="evaluate a cross-entropy run as the other cross-entropy arm. `--ce-std` and "
              "`--ce-rail` train identically and differ only in how a score is read off the "
@@ -110,6 +116,14 @@ def parse_args() -> argparse.Namespace:
 CE_VARIANTS = ("ce_std", "ce_rail")
 
 BASE_SENTINEL = "base"
+
+
+def wandb_prefix(split: str, variant: str) -> str:
+    """Summary key prefix: `test` for a single-readout run, `test-ce-rail` for a CE readout.
+
+    The CE arms share a training run, so their results must not overwrite each other there.
+    """
+    return f"{split}-{variant.replace('_', '-')}" if variant in CE_VARIANTS else split
 
 
 def resolve_run_dir(args: argparse.Namespace) -> Path:
@@ -383,6 +397,30 @@ def main() -> None:
                 snapped_metrics=snapped_metrics,
             )
             log.info("[out-csv] %s", csv_path)
+
+        skip = (
+            "--no-wandb" if args.no_wandb
+            else "W&B disabled for this run" if config.train.wandb_mode != "online"
+            else "untuned baseline" if untuned
+            else "partial result" if result.partial
+            else "--limit subset" if args.limit
+            else ""
+        )
+        if skip:
+            log.info("[wandb] not writing results to W&B (%s)", skip)
+        else:
+            prefix = wandb_prefix(args.split, config.variant)
+            values = wandb_metrics(result.metrics, prefix)
+            if snapped_metrics:
+                values |= wandb_metrics(snapped_metrics, f"{prefix}-snapped")
+            # An evaluation that scored correctly must not fail because W&B is unreachable.
+            try:
+                wid = push_wandb_summary(
+                    config.train.wandb_project, run_id, meta.get("wandb_run_id"), values
+                )
+                log.info("[wandb] wrote %d %s/* values to run %s", len(values), prefix, wid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[wandb] could not write results to W&B: %s", exc)
 
     if partial:
         sys.exit(130)
