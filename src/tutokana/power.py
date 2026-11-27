@@ -14,10 +14,10 @@ import time
 from collections.abc import Callable
 
 #: Pause an active training run gracefully if SoC drops below this percentage after a step.
-BATTERY_PAUSE_SOC = 50
+BATTERY_PAUSE_SOC = 40
 
 #: Wait until SoC reaches this percentage before starting the next run or resuming a pause.
-BATTERY_RESUME_SOC = 80
+BATTERY_RESUME_SOC = 60
 
 #: Seconds between SoC rechecks while waiting for the battery to recharge.
 BATTERY_POLL_SECONDS = 5.0
