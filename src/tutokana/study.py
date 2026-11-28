@@ -1,8 +1,8 @@
 """Batch study orchestration helpers, state management, Fisher Z aggregation, and summaries.
 
-A batch study evaluates a set of modes (subset of `heads`, `ce-std`, `ce-rail`, `raft-rail`)
-across a sequence of fixed seeds in round-robin order, serially, storing every artifact except
-the standard train/eval logs inside `batch-studies/<prefix>/`.
+A batch study evaluates a set of modes (subset of `heads`, `ce-std`, `ce-rail`, `raft-rail`,
+`veil-rail`) across a sequence of fixed seeds in round-robin order, serially, storing every
+artifact except the standard train/eval logs inside `batch-studies/<prefix>/`.
 
 Modes are what gets evaluated and reported; training runs are what gets trained. `ce-std` and
 `ce-rail` share one training objective and differ only in their inference readout, so both are
@@ -32,13 +32,14 @@ from .reporting import BASELINES, REPORT_FIELDS, Baseline, read_metrics_csv
 from .tokens import UNTRAINED_FIELDS
 
 #: Canonical order of evaluated (reported) modes.
-MODES: tuple[str, ...] = ("heads", "ce-std", "ce-rail", "raft-rail")
+MODES: tuple[str, ...] = ("heads", "ce-std", "ce-rail", "raft-rail", "veil-rail")
 
 #: Canonical round-robin order of training runs, and the modes each one is evaluated as.
 TRAIN_MODES: dict[str, tuple[str, ...]] = {
     "heads": ("heads",),
     "ce": ("ce-std", "ce-rail"),
     "raft-rail": ("raft-rail",),
+    "veil-rail": ("veil-rail",),
 }
 
 #: CLI flag passed to `train.py` for each training mode. `ce` trains under `--ce-std`; the
@@ -47,6 +48,7 @@ MODE_TO_FLAG: dict[str, tuple[str, ...]] = {
     "heads": (),
     "ce": ("--ce-std",),
     "raft-rail": ("--raft-rail",),
+    "veil-rail": ("--veil-rail",),
 }
 
 #: `evaluate.py --eval-variant` for each evaluated mode that needs one.

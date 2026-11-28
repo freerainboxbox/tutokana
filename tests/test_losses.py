@@ -352,3 +352,150 @@ def test_stress_reweighting_spans_the_vote_counts(utterances):
     assert set(values) <= {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}
     assert len(values) > 2                       # not the two-valued published label
     assert float(weights.max() / weights.min()) <= LossConfig().reweight_max + 1e-6
+
+
+# --- VEIL (composite loss on grid tokens) ---------------------------------------------
+
+
+def _grid_support(level: str, field: str, values: tuple[float, ...]):
+    from tutokana.rail import GridSupport
+
+    return GridSupport(
+        level=level,
+        field=field,
+        token_ids=torch.arange(len(values), dtype=torch.long),
+        values=torch.tensor(values, dtype=torch.float32),
+        low=min(values),
+        high=max(values),
+    )
+
+
+def test_grid_detection_logit_matches_log_odds_and_finds_ceiling_by_value():
+    from tutokana.losses import grid_detection_logit
+
+    support = _grid_support("phone", "accuracy", (0.0, 0.5, 1.0, 1.5, 2.0))
+    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 2.0]])
+    probs = torch.softmax(logits, dim=-1)
+    expected = torch.log(1 - probs[..., 4]) - torch.log(probs[..., 4])
+    torch.testing.assert_close(grid_detection_logit(support, logits), expected, atol=1e-5, rtol=1e-5)
+
+    reordered = _grid_support("phone", "accuracy", (2.0, 0.0, 1.0))
+    assert float(grid_detection_logit(reordered, torch.tensor([[5.0, 0.0, 0.0]]))) < 0.0
+
+
+def test_grid_detection_loss_skips_utterance_grids_and_runs_on_phone_and_word():
+    """Utterance scores are 95-99% below 10, so pos_weight=4.3 would upweight the majority."""
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import VEIL_DETECT_LEVELS, grid_detection_loss
+
+    assert VEIL_DETECT_LEVELS == ("phone", "word")
+    batch = HeadBatch(
+        positions=torch.zeros(2, 2, dtype=torch.long),
+        target=torch.zeros(2),
+        raw=torch.tensor([2.0, 1.0]),
+        native=torch.tensor([2.0, 1.0]),
+    )
+    logits = torch.zeros(2, 3)
+    assert grid_detection_loss(_grid_support("phone", "accuracy", (0.0, 1.0, 2.0)), logits, batch, LossConfig()) is not None
+    assert grid_detection_loss(_grid_support("word", "stress", (0.0, 2.5, 5.0)), logits, batch, LossConfig()) is not None
+    assert grid_detection_loss(_grid_support("utterance", "total", (0.0, 5.0, 10.0)), logits, batch, LossConfig()) is None
+
+
+def test_raft_and_veil_apply_level_weight_to_first_key():
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import raft_loss, veil_loss
+
+    support = _grid_support("phone", "accuracy", (0.0, 1.0, 2.0))
+    batch = HeadBatch(
+        positions=torch.zeros(2, 2, dtype=torch.long),
+        target=torch.zeros(2),
+        raw=torch.tensor([2.0, 0.0]),
+        native=torch.tensor([2.0, 0.0]),
+    )
+    logits = torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    base_cfg = LossConfig(lambda_ccc=0.0, lambda_detect=0.0, level_weights={"phone": 1.0})
+    scaled_cfg = LossConfig(lambda_ccc=0.0, lambda_detect=0.0, level_weights={"phone": 3.0})
+
+    r1, _ = raft_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, base_cfg)
+    r3, _ = raft_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, scaled_cfg)
+    torch.testing.assert_close(r3, 3.0 * r1)
+
+    v1, _ = veil_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, base_cfg)
+    v3, _ = veil_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, scaled_cfg)
+    torch.testing.assert_close(v3, 3.0 * v1)
+
+
+def test_veil_loss_combines_reweighting_detection_and_buffered_ccc():
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import veil_loss
+
+    supports = {
+        "phone.accuracy": _grid_support("phone", "accuracy", (0.0, 1.0, 2.0)),
+        "word.stress": _grid_support("word", "stress", (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)),
+        "utterance.total": _grid_support("utterance", "total", (0.0, 5.0, 10.0)),
+    }
+    heads = {
+        "phone.accuracy": HeadBatch(
+            positions=torch.zeros(4, 2, dtype=torch.long),
+            target=torch.zeros(4),
+            raw=torch.tensor([2.0, 2.0, 1.0, 0.0]),
+            native=torch.tensor([2.0, 2.0, 1.0, 0.0]),
+        ),
+        "word.stress": HeadBatch(
+            positions=torch.zeros(4, 2, dtype=torch.long),
+            target=torch.zeros(4),
+            raw=torch.tensor([5.0, 5.0, 3.0, 1.0]),
+            native=torch.tensor([10.0, 10.0, 10.0, 5.0]),
+        ),
+        "utterance.total": HeadBatch(
+            positions=torch.zeros(2, 2, dtype=torch.long),
+            target=torch.zeros(2),
+            raw=torch.tensor([8.0, 5.0]),
+            native=torch.tensor([8.0, 5.0]),
+        ),
+    }
+    logits = {
+        "phone.accuracy": torch.randn(4, 3, requires_grad=True),
+        "word.stress": torch.randn(4, 6, requires_grad=True),
+        "utterance.total": torch.randn(2, 3, requires_grad=True),
+    }
+    reweighter = LabelReweighter(
+        {
+            "phone.accuracy": {2.0: 800, 1.0: 150, 0.0: 50},
+            "word.stress": {5.0: 800, 3.0: 150, 1.0: 50},
+        }
+    )
+    buffer = CorrelationBuffer(capacity=32)
+
+    total_full, parts_full = veil_loss(
+        supports, logits, heads, LossConfig(use_veil=True),
+        buffer=buffer, reweighter=reweighter,
+    )
+    assert {"veil/phone.accuracy", "veil/word.stress", "veil/utterance.total"} <= set(parts_full)
+    assert "detect/phone.accuracy" in parts_full
+    assert "detect/word.stress" in parts_full
+    assert "detect/utterance.total" not in parts_full
+    assert {"ccc/phone.accuracy", "ccc/word.stress", "ccc/utterance.total"} <= set(parts_full)
+    assert len(buffer._predictions["phone.accuracy"]) == 4
+    assert not buffer._predictions["phone.accuracy"].requires_grad
+
+    # Disabling detection and CCC leaves only the pointwise expectation term.
+    total_min, parts_min = veil_loss(
+        supports,
+        {k: v.detach() for k, v in logits.items()},
+        heads,
+        LossConfig(use_veil=True, lambda_detect=0.0, lambda_ccc=0.0),
+    )
+    assert not any(k.startswith("detect/") or k.startswith("ccc/") for k in parts_min)
+    assert float(total_full.detach()) > float(total_min.detach())
+
+    total_full.backward()
+    for key, tensor in logits.items():
+        assert tensor.grad is not None and float(tensor.grad.abs().sum()) > 0.0, key
+
+
+def test_veil_loss_without_slots_raises():
+    from tutokana.losses import veil_loss
+
+    with pytest.raises(RuntimeError, match="no supervised score slot"):
+        veil_loss({}, {}, {}, LossConfig(use_veil=True))

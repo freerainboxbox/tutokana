@@ -42,9 +42,11 @@ def test_no_flag_trains_the_regression_heads():
         (["--ce-std"], "ce_std"),
         (["--ce-rail"], "ce_rail"),
         (["--raft-rail"], "raft_rail"),
+        (["--veil-rail"], "veil_rail"),
         (["--variant", "ce_std"], "ce_std"),
         (["--variant", "ce_rail"], "ce_rail"),
         (["--variant", "raft_rail"], "raft_rail"),
+        (["--variant", "veil_rail"], "veil_rail"),
     ],
 )
 def test_each_spelling_of_a_variant_reaches_the_config(argv, variant):
@@ -58,6 +60,8 @@ def test_each_spelling_of_a_variant_reaches_the_config(argv, variant):
         ["--ce-std", "--ce-rail"],
         ["--ce-std", "--raft-rail"],
         ["--ce-rail", "--raft-rail"],
+        ["--raft-rail", "--veil-rail"],
+        ["--ce-rail", "--veil-rail"],
     ],
 )
 def test_both_arms_at_once_is_rejected(argv):
@@ -71,6 +75,8 @@ def test_generic_and_aliased_spellings_cannot_be_combined():
         _config(["--variant", "ce_rail", "--raft-rail"])
     with pytest.raises(SystemExit):
         _config(["--variant", "ce_std", "--ce-rail"])
+    with pytest.raises(SystemExit):
+        _config(["--variant", "raft_rail", "--veil-rail"])
 
 
 def test_an_unknown_variant_is_rejected_at_the_parser():
@@ -98,13 +104,16 @@ def test_config_rejects_a_variant_outside_the_set(bad):
 def test_a_rejected_variant_names_the_ones_that_exist():
     with pytest.raises(SystemExit) as excinfo:
         Config(variant="rail")
-    assert "heads, ce_std, ce_rail, raft_rail" in str(excinfo.value)
+    assert "heads, ce_std, ce_rail, raft_rail, veil_rail" in str(excinfo.value)
 
 
 # --- resume: the variant must survive the round trip ----------------------------------
 
 
-@pytest.mark.parametrize("flag,variant", [("--ce-std", "ce_std"), ("--raft-rail", "raft_rail")])
+@pytest.mark.parametrize(
+    "flag,variant",
+    [("--ce-std", "ce_std"), ("--raft-rail", "raft_rail"), ("--veil-rail", "veil_rail")],
+)
 def test_variant_survives_the_config_round_trip(flag, variant):
     """The resume file is `asdict(config)`, so an unwritten field resumes as the default."""
     assert Config.from_dict(_config([flag]).to_dict()).variant == variant
@@ -178,10 +187,11 @@ def test_ce_arms_without_a_text_loss_would_train_nothing(variant):
         Config(variant=variant, lambda_lm=0.0)
 
 
-def test_raft_rail_without_a_raft_loss_would_train_nothing():
-    """The score token is masked from CE under `--raft-rail`, so lambda_raft=0 trains no score."""
+@pytest.mark.parametrize("variant", ["raft_rail", "veil_rail"])
+def test_raft_rail_without_a_raft_loss_would_train_nothing(variant):
+    """The score token is masked from CE under RAFT/VEIL, so lambda_raft=0 trains no score."""
     with pytest.raises(SystemExit, match="trains nothing"):
-        Config(variant="raft_rail", lambda_raft=0.0)
+        Config(variant=variant, lambda_raft=0.0)
 
 
 def test_only_declared_variants_can_be_listed_as_missing(monkeypatch):
@@ -198,22 +208,33 @@ def test_emits_scores_is_the_single_switch_downstream_code_reads():
         "ce_std": True,
         "ce_rail": True,
         "raft_rail": True,
+        "veil_rail": True,
     }
     assert {v: Config(variant=v).score_ce for v in VARIANTS} == {
         "heads": False,
         "ce_std": True,
         "ce_rail": True,
         "raft_rail": False,
+        "veil_rail": False,
     }
     assert {v: Config(variant=v).uses_raft for v in VARIANTS} == {
         "heads": False,
         "ce_std": False,
         "ce_rail": False,
         "raft_rail": True,
+        "veil_rail": True,
+    }
+    assert {v: Config(variant=v).uses_veil for v in VARIANTS} == {
+        "heads": False,
+        "ce_std": False,
+        "ce_rail": False,
+        "raft_rail": False,
+        "veil_rail": True,
     }
     assert {v: Config(variant=v).score_readout for v in VARIANTS} == {
         "heads": "expectation",
         "ce_std": "mode",
         "ce_rail": "expectation",
         "raft_rail": "expectation",
+        "veil_rail": "expectation",
     }

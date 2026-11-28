@@ -889,6 +889,39 @@ def test_raft_loss_descends_when_stepped_on_the_grid(raft):
     assert float(loss.detach()) < first / 10, (first, float(loss.detach()))
 
 
+def test_veil_loss_reaches_delta_and_passes_preflight(raft):
+    """`--veil-rail` applies composite anti-collapse terms on grid logits and restores buffer."""
+    from tutokana.losses import CorrelationBuffer, build_reweighter
+
+    model, collator, sample = raft
+    cfg = LossConfig(lambda_lm=0.5, lambda_raft=1.0, use_veil=True)
+    reweighter = build_reweighter(sample, cfg)
+    buffer = CorrelationBuffer(capacity=64)
+
+    # Preflight must succeed and leave the correlation buffer untouched.
+    preflight(model, collator, sample[:2], CPU, cfg, reweighter=reweighter, buffer=buffer)
+    assert buffer._predictions == {}
+
+    batch = move_batch(collator(sample[:2]), CPU)
+    _, lm_loss, gathered = model(batch)
+    loss, parts = composite_loss(
+        model.heads, {}, batch["heads"], cfg,
+        buffer=buffer, reweighter=reweighter, lm_loss=lm_loss,
+        score_logits=gathered, supports=model.supports,
+    )
+    assert {"loss/lm", "loss/veil", "loss/total"} <= set(parts)
+    assert "loss/raft" not in parts
+    assert "detect/phone.accuracy" in parts
+    assert "detect/word.stress" in parts
+    assert not any(k.startswith("detect/utterance.") for k in parts)
+    assert "ccc/phone.accuracy" in parts
+    assert "phone.accuracy" in buffer._predictions
+
+    loss.backward()
+    assert model.register_delta.delta.grad is not None
+    assert float(model.register_delta.delta.grad.abs().sum()) > 0.0
+
+
 # --- the --ce-std arm: mode-seeking autoregression restricted to the grid ----------------
 
 

@@ -1,8 +1,9 @@
 """Run a multi-seed, multi-mode training and evaluation batch study in serial.
 
-Evaluates each active mode (`heads`, `ce-std`, `ce-rail`, `raft-rail`) across every given seed
-in round-robin order. `ce-std` and `ce-rail` share a training objective, so they are both
-evaluated from one `ce` training run; the training runs per round are `heads`, `ce`, `raft-rail`:
+Evaluates each active mode (`heads`, `ce-std`, `ce-rail`, `raft-rail`, `veil-rail`) across
+every given seed in round-robin order. `ce-std` and `ce-rail` share a training objective, so
+they are both evaluated from one `ce` training run; the training runs per round are `heads`,
+`ce`, `raft-rail`, `veil-rail`:
 
     python batch_study.py --prefix alpha --seeds 42,43,44,45,46
     python batch_study.py --prefix alpha --seeds 42,43 --no-ce-std
@@ -78,6 +79,7 @@ _BATCH_CONTROLLED_TRAIN_FLAGS = frozenset(
         "--ce-std",
         "--ce-rail",
         "--raft-rail",
+        "--veil-rail",
         "--min-battery-soc",
     }
 )

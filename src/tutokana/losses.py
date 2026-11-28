@@ -164,14 +164,21 @@ class LossConfig:
     #: Positive-class weight in that term; 4.3 balances phone accuracy's 19% base rate, and
     #: happens to suit word stress too — 20.0% of words draw at least one dissenting expert.
     detect_pos_weight: float = 4.3
-    #: Weight on the RAFT term, which supervises the grid expectation instead of the emitted
-    #: token. This is the whole score objective under `--raft-rail`, so it defaults to 1.0;
-    #: 0 leaves that arm with no score term at all and the config refuses it.
+    #: Weight on the RAFT/VEIL grid-expectation term. This is the whole score objective under
+    #: `--raft-rail` and `--veil-rail`, so it defaults to 1.0; 0 leaves those arms with no
+    #: score term at all and the config refuses it.
     lambda_raft: float = 1.0
+    #: Enable VEIL (Variance & Expectation Informed Language loss) on grid logits: extends
+    #: RAFT with label reweighting, ceiling detection (phone/word), and CCC + buffer.
+    use_veil: bool = False
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.
 ALWAYS_REWEIGHTED = ("word.stress",)
+#: Grid levels where VEIL applies ceiling-detection BCE. Utterance scores are 95-99% below 10,
+#: so applying `detect_pos_weight` there would upweight the majority class (matching `heads`,
+#: where utterance heads are `regression` and skip detection).
+VEIL_DETECT_LEVELS = ("phone", "word")
 
 
 class LabelReweighter:
@@ -290,6 +297,33 @@ def head_loss(
     return elementwise.mean(), head.predict_normalized(logits)
 
 
+def grid_detection_logit(support, logits: torch.Tensor) -> torch.Tensor | None:
+    """Log-odds that this grid score is *below* the grid's ceiling, from restricted logits."""
+    if support.values.numel() < 2 or logits.shape[-1] < 2:
+        return None
+    top = int(torch.argmax(support.values))
+    others = [i for i in range(logits.shape[-1]) if i != top]
+    if not others:
+        return None
+    logits_f32 = logits.float()
+    return torch.logsumexp(logits_f32[..., others], dim=-1) - logits_f32[..., top]
+
+
+def grid_detection_loss(
+    support, logits: torch.Tensor, batch, config: LossConfig
+) -> torch.Tensor | None:
+    """Binary cross-entropy on "below the ceiling" for ceiling-saturated grid levels."""
+    if support.level not in VEIL_DETECT_LEVELS:
+        return None
+    logit = grid_detection_logit(support, logits)
+    if logit is None:
+        return None
+    ceiling = float(support.values.max())
+    target = (batch.raw < ceiling).to(logit.dtype)
+    weight = logit.new_tensor(config.detect_pos_weight)
+    return F.binary_cross_entropy_with_logits(logit, target, pos_weight=weight)
+
+
 def raft_loss(
     supports: dict,
     score_logits: dict[str, torch.Tensor],
@@ -327,12 +361,85 @@ def raft_loss(
             continue
         residual = support.expectation_normalized(logits) - support.normalize_value(batch.raw)
         term = (residual ** 2).mean()
-        total = term if total is None else total + weight * term
+        weighted = weight * term
+        total = weighted if total is None else total + weighted
         parts[f"raft/{key}"] = float(term.detach())
     if total is None:
         raise RuntimeError(
             "raft_loss was asked for, but the batch carried no supervised score slot. Under "
             "--raft-rail that means the run has no score objective at all."
+        )
+    return total, parts
+
+
+def veil_loss(
+    supports: dict,
+    score_logits: dict[str, torch.Tensor],
+    heads: dict,
+    config: LossConfig,
+    buffer: CorrelationBuffer | None = None,
+    reweighter: LabelReweighter | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """VEIL (Variance & Expectation Informed Language loss): composite loss on grid tokens.
+
+    Extends RAFT with the three anti-collapse mechanisms from the head path:
+    - capped inverse-frequency reweighting on `reweight_levels` and `ALWAYS_REWEIGHTED`
+    - ceiling-detection BCE on `VEIL_DETECT_LEVELS` (`phone`, `word`) to counter endpoint
+      softmax saturation when p_top approaches 1
+    - `1 - CCC` with `CorrelationBuffer`, both on the grid's `[-1, 1]` span so `word.stress`
+      compares 0-5 vote counts rather than mixing vote expectations with 5/10 median z-scores
+    """
+    total: torch.Tensor | None = None
+    parts: dict[str, float] = {}
+    for key, logits in score_logits.items():
+        support, batch = supports.get(key), heads.get(key)
+        if support is None or batch is None or len(batch) == 0:
+            continue
+        level = key.split(".", 1)[0]
+        weight = config.level_weights.get(level, 1.0)
+        if weight == 0.0:
+            continue
+
+        logits_f32 = logits.float()
+        pred = support.expectation_normalized(logits_f32)
+        gold = support.normalize_value(batch.raw).to(pred.dtype)
+
+        elementwise = (pred - gold) ** 2
+        if reweighter is not None and (
+            level in config.reweight_levels or key in ALWAYS_REWEIGHTED
+        ):
+            sample_weight = reweighter.weights_for(key, batch.raw)
+            if sample_weight is not None:
+                elementwise = elementwise * sample_weight.to(elementwise.dtype)
+        pointwise = elementwise.mean()
+        term = pointwise
+        parts[f"veil/{key}"] = float(pointwise.detach())
+
+        if config.lambda_detect > 0.0:
+            detection = grid_detection_loss(support, logits_f32, batch, config)
+            if detection is not None:
+                term = term + config.lambda_detect * detection
+                parts[f"detect/{key}"] = float(detection.detach())
+
+        if config.lambda_ccc > 0.0:
+            if buffer is not None:
+                augmented_pred, augmented_target = buffer.augmented(key, pred, gold)
+            else:
+                augmented_pred, augmented_target = pred, gold
+            ccc = concordance(augmented_pred, augmented_target)
+            term = term + config.lambda_ccc * (1.0 - ccc)
+            parts[f"ccc/{key}"] = float(ccc.detach())
+
+        if buffer is not None:
+            buffer.extend(key, pred, gold)
+
+        weighted = weight * term
+        total = weighted if total is None else total + weighted
+
+    if total is None:
+        raise RuntimeError(
+            "veil_loss was asked for, but the batch carried no supervised score slot. Under "
+            "--veil-rail that means the run has no score objective at all."
         )
     return total, parts
 
@@ -409,10 +516,23 @@ def composite_loss(
         parts["loss/lm"] = float(lm_loss.detach())
 
     if score_logits and config.lambda_raft > 0.0:
-        raft, raft_parts = raft_loss(supports or {}, score_logits, heads, config)
-        total = total + config.lambda_raft * raft
-        parts.update(raft_parts)
-        parts["loss/raft"] = float(raft.detach())
+        if config.use_veil:
+            veil, veil_parts = veil_loss(
+                supports or {},
+                score_logits,
+                heads,
+                config,
+                buffer=buffer,
+                reweighter=reweighter,
+            )
+            total = total + config.lambda_raft * veil
+            parts.update(veil_parts)
+            parts["loss/veil"] = float(veil.detach())
+        else:
+            raft, raft_parts = raft_loss(supports or {}, score_logits, heads, config)
+            total = total + config.lambda_raft * raft
+            parts.update(raft_parts)
+            parts["loss/raft"] = float(raft.detach())
 
     parts["loss/total"] = float(total.detach())
     return total, parts

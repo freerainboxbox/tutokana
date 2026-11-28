@@ -99,6 +99,7 @@ parser.add_argument("--train-seed", type=int, default=3407)
 parser.add_argument("--ce-std", action="store_true")
 parser.add_argument("--ce-rail", action="store_true")
 parser.add_argument("--raft-rail", action="store_true")
+parser.add_argument("--veil-rail", action="store_true")
 parser.add_argument("--min-battery-soc", type=int, default=0)
 args, extra = parser.parse_known_args()
 
@@ -112,6 +113,8 @@ elif args.ce_rail:
     mode = "ce-rail"
 elif args.raft_rail:
     mode = "raft-rail"
+elif args.veil_rail:
+    mode = "veil-rail"
 elif args.resume and (run_dir / RESUME_META).exists():
     saved = json.loads((run_dir / RESUME_META).read_text())
     mode = saved["mode"]
@@ -221,7 +224,7 @@ if (
                 Path(args.out).write_text(json.dumps({{"run_id": run_id, "partial": True}}))
             sys.exit(130)
 
-mode_offset = {{"heads": 0.72, "ce-std": 0.45, "ce-rail": 0.58, "raft-rail": 0.70}}[mode]
+mode_offset = {{"heads": 0.72, "ce-std": 0.45, "ce-rail": 0.58, "raft-rail": 0.70, "veil-rail": 0.74}}[mode]
 seed_delta = ((seed % 10) - 2) * 0.005
 metrics = {{}}
 for i, key in enumerate(APPLICABLE_FIELDS):
@@ -349,32 +352,42 @@ def test_metrics_csv_round_trips_all_columns(tmp_path):
 
 def test_schedule_is_round_robin_with_seed_depending_only_on_round():
     modes = resolve_modes(set())
-    assert modes == ["heads", "ce-std", "ce-rail", "raft-rail"]
+    assert modes == ["heads", "ce-std", "ce-rail", "raft-rail", "veil-rail"]
     schedule = build_schedule("alpha", modes, [42, 43])
     assert [r["run_id"] for r in schedule] == [
         "alpha_heads_1_42",
         "alpha_ce_1_42",
         "alpha_raft-rail_1_42",
+        "alpha_veil-rail_1_42",
         "alpha_heads_2_43",
         "alpha_ce_2_43",
         "alpha_raft-rail_2_43",
+        "alpha_veil-rail_2_43",
     ]
     # ce-std and ce-rail share one training run and are evaluated from it separately.
-    assert [[ev["mode"] for ev in r["evals"]] for r in schedule[:3]] == [
-        ["heads"], ["ce-std", "ce-rail"], ["raft-rail"],
+    assert [[ev["mode"] for ev in r["evals"]] for r in schedule[:4]] == [
+        ["heads"], ["ce-std", "ce-rail"], ["raft-rail"], ["veil-rail"],
     ]
     assert make_run_id("alpha", "raft-rail", 1, 42) == "alpha_raft-rail_1_42"
+    assert make_run_id("gamma", "veil-rail", 1, 42) == "gamma_veil-rail_1_42"
 
 
 def test_schedule_drops_excluded_evals_and_runs_with_none_left():
-    schedule = build_schedule("alpha", resolve_modes({"ce-std"}), [42])
+    schedule = build_schedule("alpha", resolve_modes({"ce-std", "veil-rail"}), [42])
     assert [(r["run_id"], [ev["mode"] for ev in r["evals"]]) for r in schedule] == [
         ("alpha_heads_1_42", ["heads"]),
         ("alpha_ce_1_42", ["ce-rail"]),
         ("alpha_raft-rail_1_42", ["raft-rail"]),
     ]
-    schedule = build_schedule("alpha", resolve_modes({"ce-std", "ce-rail"}), [42])
+    schedule = build_schedule("alpha", resolve_modes({"ce-std", "ce-rail", "veil-rail"}), [42])
     assert [r["run_id"] for r in schedule] == ["alpha_heads_1_42", "alpha_raft-rail_1_42"]
+    gamma = build_schedule(
+        "gamma", resolve_modes({"heads", "ce-std", "ce-rail", "raft-rail"}), [42, 43]
+    )
+    assert [(r["run_id"], [ev["mode"] for ev in r["evals"]]) for r in gamma] == [
+        ("gamma_veil-rail_1_42", ["veil-rail"]),
+        ("gamma_veil-rail_2_43", ["veil-rail"]),
+    ]
 
 
 def test_old_schema_study_state_is_refused(tmp_path):
@@ -387,7 +400,7 @@ def test_old_schema_study_state_is_refused(tmp_path):
 
 
 def test_mode_exclusions_preserve_round_robin_order():
-    modes = resolve_modes({"ce-std", "raft-rail"})
+    modes = resolve_modes({"ce-std", "raft-rail", "veil-rail"})
     assert modes == ["heads", "ce-rail"]
     with pytest.raises(SystemExit, match="all modes were excluded"):
         resolve_modes(set(MODES))
@@ -432,7 +445,13 @@ def test_starting_new_study_while_any_study_is_paused_warns_and_exits(tmp_path):
 
 
 def test_batch_controlled_train_flags_are_rejected():
-    for bad in (["--train-seed", "99"], ["--ce-rail"], ["--run-id", "x"], ["--run-dir", "y"]):
+    for bad in (
+        ["--train-seed", "99"],
+        ["--ce-rail"],
+        ["--veil-rail"],
+        ["--run-id", "x"],
+        ["--run-dir", "y"],
+    ):
         with pytest.raises(SystemExit, match="managed by batch_study.py"):
             batch_study.parse_args(["--prefix", "a", "--seeds", "1", *bad])
 
@@ -472,7 +491,7 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
     events = [json.loads(line) for line in trace_file.read_text().splitlines()]
     seeds = [(1, 42), (2, 43), (3, 44)]
     expected_train = [
-        f"alpha_{m}_{r}_{s}" for r, s in seeds for m in ("heads", "ce", "raft-rail")
+        f"alpha_{m}_{r}_{s}" for r, s in seeds for m in ("heads", "ce", "raft-rail", "veil-rail")
     ]
     expected_sequence = []
     for r, s in seeds:
@@ -482,6 +501,8 @@ def test_end_to_end_study_runs_serial_round_robin_and_writes_summaries(tmp_path)
             ("eval", f"alpha_ce_{r}_{s}", "ce-std"), ("eval", f"alpha_ce_{r}_{s}", "ce-rail"),
             ("train", f"alpha_raft-rail_{r}_{s}"),
             ("eval", f"alpha_raft-rail_{r}_{s}", "raft-rail"),
+            ("train", f"alpha_veil-rail_{r}_{s}"),
+            ("eval", f"alpha_veil-rail_{r}_{s}", "veil-rail"),
         ]
     assert [
         (e["cmd"], e["run_id"]) if e["cmd"] == "train" else (e["cmd"], e["run_id"], e["mode"])
@@ -596,7 +617,7 @@ batch_study.run_batch_study(
         [
             sys.executable, str(runner),
             "--prefix", "alpha", "--seeds", "42,43",
-            "--no-ce-rail", "--no-raft-rail",
+            "--no-ce-rail", "--no-raft-rail", "--no-veil-rail",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -699,7 +720,7 @@ batch_study.run_batch_study(
         [
             sys.executable, str(runner),
             "--prefix", "alpha", "--seeds", "42",
-            "--no-ce-std", "--no-ce-rail", "--no-raft-rail",
+            "--no-ce-std", "--no-ce-rail", "--no-raft-rail", "--no-veil-rail",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -771,7 +792,7 @@ batch_study.run_batch_study(
         [
             sys.executable, str(runner),
             "--prefix", "alpha", "--seeds", "42",
-            "--no-heads", "--no-raft-rail",
+            "--no-heads", "--no-raft-rail", "--no-veil-rail",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -831,6 +852,9 @@ def test_train_and_evaluate_cli_accept_new_flags(monkeypatch):
     monkeypatch.setattr("sys.argv", ["evaluate.py", "--eval-variant", "ce_rail"])
     assert evaluate.parse_args().eval_variant == "ce_rail"
     monkeypatch.setattr("sys.argv", ["evaluate.py", "--eval-variant", "raft_rail"])
+    with pytest.raises(SystemExit):
+        evaluate.parse_args()
+    monkeypatch.setattr("sys.argv", ["evaluate.py", "--eval-variant", "veil_rail"])
     with pytest.raises(SystemExit):
         evaluate.parse_args()
 
@@ -911,6 +935,7 @@ def test_wandb_prefix_separates_the_ce_readouts():
 
     assert evaluate.wandb_prefix("test", "heads") == "test"
     assert evaluate.wandb_prefix("test", "raft_rail") == "test"
+    assert evaluate.wandb_prefix("test", "veil_rail") == "test"
     assert evaluate.wandb_prefix("test", "ce_std") == "test-ce-std"
     assert evaluate.wandb_prefix("test", "ce_rail") == "test-ce-rail"
 
@@ -1053,7 +1078,7 @@ def test_batch_study_waits_for_80_between_runs_and_resumes_after_mid_run_battery
     study_dir = batch_study.run_batch_study(
         [
             "--prefix", "beta", "--seeds", "12,17",
-            "--no-ce-std", "--no-ce-rail", "--no-raft-rail",
+            "--no-ce-std", "--no-ce-rail", "--no-raft-rail", "--no-veil-rail",
         ],
         batch_root=batch_root,
         train_script=fake_train,
@@ -1082,7 +1107,7 @@ def test_batch_study_omits_min_battery_soc_on_non_mac_hosts(tmp_path, monkeypatc
 
     monkeypatch.setattr(batch_study, "is_mac_host", lambda: False)
     batch_study.run_batch_study(
-        ["--prefix", "linuxrun", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail"],
+        ["--prefix", "linuxrun", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail", "--no-veil-rail"],
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
@@ -1168,7 +1193,7 @@ def test_mark_abandoned_preserves_artifacts_and_unblocks_new_study(tmp_path, cap
 
     # A new study prefix is now allowed to start and complete.
     beta_dir = batch_study.run_batch_study(
-        ["--prefix", "beta", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail"],
+        ["--prefix", "beta", "--seeds", "12", "--no-ce-std", "--no-ce-rail", "--no-raft-rail", "--no-veil-rail"],
         batch_root=batch_root,
         train_script=fake_train,
         eval_script=fake_eval,
@@ -1284,3 +1309,33 @@ def test_resume_abandoned_study_while_another_paused_confirms_abandoning_paused(
     assert load_study_state(beta_dir)["status"] == "abandoned"
     assert load_study_state(beta_dir)["abandoned_at"] is not None
     assert load_study_state(alpha_dir)["status"] == "completed"
+
+
+def test_gamma_veil_rail_only_batch_study_end_to_end(tmp_path):
+    """Running a study with veil-rail alone schedules only --veil-rail runs and summarizes them."""
+    fake_train, fake_eval, trace_file = _write_fake_scripts(tmp_path)
+    batch_root = tmp_path / "batch-studies"
+
+    study_dir = batch_study.run_batch_study(
+        [
+            "--prefix", "gamma",
+            "--seeds", "42,43",
+            "--no-heads", "--no-ce-std", "--no-ce-rail", "--no-raft-rail",
+        ],
+        batch_root=batch_root,
+        train_script=fake_train,
+        eval_script=fake_eval,
+        read_soc=lambda: None,
+    )
+    assert load_study_state(study_dir)["status"] == "completed"
+    events = [json.loads(line) for line in trace_file.read_text().splitlines()]
+    assert [
+        (e["cmd"], e["run_id"], e["mode"]) for e in events
+    ] == [
+        ("train", "gamma_veil-rail_1_42", "veil-rail"),
+        ("eval", "gamma_veil-rail_1_42", "veil-rail"),
+        ("train", "gamma_veil-rail_2_43", "veil-rail"),
+        ("eval", "gamma_veil-rail_2_43", "veil-rail"),
+    ]
+    assert (study_dir / "summary.csv").exists()
+    assert (study_dir / "summary.txt").exists()

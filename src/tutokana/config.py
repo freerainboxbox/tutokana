@@ -31,9 +31,10 @@ LOG_DATEFMT = "%H:%M:%S"
 
 #: The output channel a run trains. `heads` reads every score out of a regression head at a
 #: register; the emitted-score arms emit one grid token per score instead — `--ce-std` reads
-#: the argmax token off the grid (naive mode-seeking autoregression), while `--ce-rail` and
-#: `--raft-rail` read the grid expectation. See the README section "Ablations & Variants".
-VARIANTS = ("heads", "ce_std", "ce_rail", "raft_rail")
+#: the argmax token off the grid (naive mode-seeking autoregression), while `--ce-rail`,
+#: `--raft-rail` and `--veil-rail` read the grid expectation. See the README section
+#: "Ablations & Variants".
+VARIANTS = ("heads", "ce_std", "ce_rail", "raft_rail", "veil_rail")
 
 #: What each variant still needs before it can train. The guard exists because a parsed flag
 #: that nothing reads is worse than no flag: the run would train the head model, record
@@ -91,8 +92,8 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     head_modes: HeadModeConfig = field(default_factory=HeadModeConfig)
-    #: One field, not a boolean per arm: `--ce-std`, `--ce-rail` and `--raft-rail` are
-    #: alternatives to each other and to the default, so separate booleans would accept
+    #: One field, not a boolean per arm: `--ce-std`, `--ce-rail`, `--raft-rail` and `--veil-rail`
+    #: are alternatives to each other and to the default, so separate booleans would accept
     #: conflicting arms and hand `Config.diff` a conflict with no meaning. `choices` is read
     #: by the argparse binder, which derives one flag per non-default value.
     variant: str = field(default="heads", metadata={"choices": VARIANTS})
@@ -112,8 +113,8 @@ class Config:
     reweight_max: float = 10.0
     lambda_detect: float = 0.5
     detect_pos_weight: float = 4.3
-    #: Weight on the grid-expectation term. Under `--raft-rail` this is the only score
-    #: supervision the run has.
+    #: Weight on the grid-expectation term. Under `--raft-rail` and `--veil-rail` this is the
+    #: only score supervision the run has.
     lambda_raft: float = 1.0
     stress_concentration: float = 8.6
     stress_siblings: bool = False
@@ -145,11 +146,12 @@ class Config:
                 f"{flag} with --lambda-lm 0 trains nothing: cross-entropy on the emitted "
                 "score token is the only score supervision that arm has."
             )
-        # The mirror case. `--raft-rail` masks the score token out of the text loss on
-        # purpose, so the grid term is not merely one term among several there.
-        if self.variant == "raft_rail" and self.lambda_raft <= 0.0:
+        # The mirror case. `--raft-rail` and `--veil-rail` mask the score token out of the text
+        # loss on purpose, so the grid term is not merely one term among several there.
+        if self.uses_raft and self.lambda_raft <= 0.0:
+            flag = f"--{self.variant.replace('_', '-')}"
             raise SystemExit(
-                "--raft-rail with --lambda-raft 0 trains nothing: the grid expectation is "
+                f"{flag} with --lambda-raft 0 trains nothing: the grid expectation is "
                 "the only score supervision that arm has, and its token is masked out of "
                 "the text loss by design."
             )
@@ -169,8 +171,13 @@ class Config:
 
     @property
     def uses_raft(self) -> bool:
-        """Whether the RAFT grid-expectation loss supervises the scores (`--raft-rail`)."""
-        return self.variant == "raft_rail"
+        """Whether the grid-expectation loss supervises scores (`--raft-rail`, `--veil-rail`)."""
+        return self.variant in ("raft_rail", "veil_rail")
+
+    @property
+    def uses_veil(self) -> bool:
+        """Whether VEIL extends RAFT with CCC, detection, and reweighting (`--veil-rail`)."""
+        return self.variant == "veil_rail"
 
     @property
     def score_readout(self) -> str:

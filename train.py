@@ -208,9 +208,9 @@ def main() -> None:
         # Registered once here and handed to the collator: under a variant the delta needs the
         # grid rows, and registering twice would only make the id source ambiguous.
         grid_ids = register_grid_tokens(tokenizer) if config.emits_scores else None
-        # The grid supports are the RAFT loss's view of the same grid the renderer emits: only
-        # `--raft-rail` gathers grid logits during training, so `--ce-std` and `--ce-rail` stay
-        # pure cross-entropy and never pay for a gather they do not use.
+        # The grid supports are the RAFT/VEIL loss's view of the same grid the renderer emits:
+        # only `--raft-rail` and `--veil-rail` gather grid logits during training, so `--ce-std`
+        # and `--ce-rail` stay pure cross-entropy and never pay for a gather they do not use.
         supports = grid_supports(grid_ids) if config.uses_raft else {}
         # A variant replaces the output channel rather than adding to it. With the scores in
         # the text, a head reading the same field would be a second channel in the same run,
@@ -282,6 +282,7 @@ def main() -> None:
             lambda_detect=config.lambda_detect,
             detect_pos_weight=config.detect_pos_weight,
             lambda_raft=config.lambda_raft if config.uses_raft else 0.0,
+            use_veil=config.uses_veil,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
         buffer = CorrelationBuffer(loss_config.buffer_capacity)
