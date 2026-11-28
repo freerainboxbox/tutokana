@@ -149,7 +149,7 @@ This uses moment matching instead of maximum likelihood because it is closed-for
 
 **Masking**
 
-- The model masks language-model cross-entropy at register positions and audio positions. Supervising the constant ` također` id collapses representations at speech positions, which prevents the model from hearing.
+- The model masks language-model cross-entropy at register positions and audio positions. Supervising the constant `<|audio|>` id collapses representations at speech positions, which prevents the model from hearing.
 
 **Training**
 
