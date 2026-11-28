@@ -83,6 +83,7 @@ Phone accuracy is the main result. The best previous generative model reached 0.
 **Reading**
 
 - Each level uses a learned softmax mixture over the last 8 hidden states. This is biased low for phones and high for utterances. Lower layers predict fine-grained scores better.
+- The mixture is specifically a weighted average of the last 8 transformer hidden states (via `LayerMixture`). The amount of weight is determined by learnable logits for each level (utterance, word, phone), with a softmax applied to determine how much each of the last 8 layers contributes.
 - The model reads a register at its own position. The −1 shift is only for language-model cross-entropy.
 
 **Heads**
