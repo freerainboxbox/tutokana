@@ -39,10 +39,12 @@ def test_no_flag_trains_the_regression_heads():
 @pytest.mark.parametrize(
     "argv,variant",
     [
+        (["--heads-bccc"], "heads_bccc"),
         (["--ce-std"], "ce_std"),
         (["--ce-rail"], "ce_rail"),
         (["--raft-rail"], "raft_rail"),
         (["--veil-rail"], "veil_rail"),
+        (["--variant", "heads_bccc"], "heads_bccc"),
         (["--variant", "ce_std"], "ce_std"),
         (["--variant", "ce_rail"], "ce_rail"),
         (["--variant", "raft_rail"], "raft_rail"),
@@ -57,6 +59,7 @@ def test_each_spelling_of_a_variant_reaches_the_config(argv, variant):
 @pytest.mark.parametrize(
     "argv",
     [
+        ["--heads-bccc", "--veil-rail"],
         ["--ce-std", "--ce-rail"],
         ["--ce-std", "--raft-rail"],
         ["--ce-rail", "--raft-rail"],
@@ -77,6 +80,8 @@ def test_generic_and_aliased_spellings_cannot_be_combined():
         _config(["--variant", "ce_std", "--ce-rail"])
     with pytest.raises(SystemExit):
         _config(["--variant", "raft_rail", "--veil-rail"])
+    with pytest.raises(SystemExit):
+        _config(["--variant", "heads_bccc", "--ce-rail"])
 
 
 def test_an_unknown_variant_is_rejected_at_the_parser():
@@ -104,7 +109,7 @@ def test_config_rejects_a_variant_outside_the_set(bad):
 def test_a_rejected_variant_names_the_ones_that_exist():
     with pytest.raises(SystemExit) as excinfo:
         Config(variant="rail")
-    assert "heads, ce_std, ce_rail, raft_rail, veil_rail" in str(excinfo.value)
+    assert "heads, heads_bccc, ce_std, ce_rail, raft_rail, veil_rail" in str(excinfo.value)
 
 
 # --- resume: the variant must survive the round trip ----------------------------------
@@ -112,7 +117,12 @@ def test_a_rejected_variant_names_the_ones_that_exist():
 
 @pytest.mark.parametrize(
     "flag,variant",
-    [("--ce-std", "ce_std"), ("--raft-rail", "raft_rail"), ("--veil-rail", "veil_rail")],
+    [
+        ("--heads-bccc", "heads_bccc"),
+        ("--ce-std", "ce_std"),
+        ("--raft-rail", "raft_rail"),
+        ("--veil-rail", "veil_rail"),
+    ],
 )
 def test_variant_survives_the_config_round_trip(flag, variant):
     """The resume file is `asdict(config)`, so an unwritten field resumes as the default."""
@@ -205,6 +215,7 @@ def test_emits_scores_is_the_single_switch_downstream_code_reads():
     """The mask, the loss and the decode loop all key off these properties, so arms cannot drift."""
     assert {v: Config(variant=v).emits_scores for v in VARIANTS} == {
         "heads": False,
+        "heads_bccc": False,
         "ce_std": True,
         "ce_rail": True,
         "raft_rail": True,
@@ -212,6 +223,7 @@ def test_emits_scores_is_the_single_switch_downstream_code_reads():
     }
     assert {v: Config(variant=v).score_ce for v in VARIANTS} == {
         "heads": False,
+        "heads_bccc": False,
         "ce_std": True,
         "ce_rail": True,
         "raft_rail": False,
@@ -219,6 +231,7 @@ def test_emits_scores_is_the_single_switch_downstream_code_reads():
     }
     assert {v: Config(variant=v).uses_raft for v in VARIANTS} == {
         "heads": False,
+        "heads_bccc": False,
         "ce_std": False,
         "ce_rail": False,
         "raft_rail": True,
@@ -226,15 +239,56 @@ def test_emits_scores_is_the_single_switch_downstream_code_reads():
     }
     assert {v: Config(variant=v).uses_veil for v in VARIANTS} == {
         "heads": False,
+        "heads_bccc": False,
         "ce_std": False,
         "ce_rail": False,
         "raft_rail": False,
         "veil_rail": True,
     }
+    assert {v: Config(variant=v).uses_bccc for v in VARIANTS} == {
+        "heads": False,
+        "heads_bccc": True,
+        "ce_std": False,
+        "ce_rail": False,
+        "raft_rail": False,
+        "veil_rail": True,
+    }
+    assert {v: Config(variant=v).buffer_level_capacities() for v in VARIANTS} == {
+        "heads": {},
+        "heads_bccc": {"utterance": 64},
+        "ce_std": {},
+        "ce_rail": {},
+        "raft_rail": {},
+        "veil_rail": {"utterance": 64},
+    }
     assert {v: Config(variant=v).score_readout for v in VARIANTS} == {
         "heads": "expectation",
+        "heads_bccc": "expectation",
         "ce_std": "mode",
         "ce_rail": "expectation",
         "raft_rail": "expectation",
         "veil_rail": "expectation",
     }
+
+
+def test_bccc_variants_resolve_their_calibrated_lambda_ccc_defaults_and_allow_overrides(monkeypatch):
+    import train
+
+    assert _config([]).lambda_ccc == pytest.approx(0.5)
+    assert _config(["--heads-bccc"]).lambda_ccc == pytest.approx(0.1)
+    assert _config(["--veil-rail"]).lambda_ccc == pytest.approx(0.05)
+
+    # Explicit overrides — including overriding back to 0.5 or down to 0.0 — are honoured.
+    assert _config(["--heads-bccc", "--lambda-ccc", "0.5"]).lambda_ccc == pytest.approx(0.5)
+    assert _config(["--veil-rail", "--lambda-ccc", "0.0"]).lambda_ccc == pytest.approx(0.0)
+    assert Config.from_dict(_config(["--heads-bccc"]).to_dict()).lambda_ccc == pytest.approx(0.1)
+    assert Config.from_dict(_config(["--veil-rail"]).to_dict()).lambda_ccc == pytest.approx(0.05)
+
+    # Omitting --lambda-ccc does not mark it explicit (critical for --resume).
+    monkeypatch.setattr("sys.argv", ["train.py", "--heads-bccc"])
+    _, explicit = train.parse_args()
+    assert "variant" in explicit and "lambda_ccc" not in explicit
+
+    monkeypatch.setattr("sys.argv", ["train.py", "--heads-bccc", "--lambda-ccc", "0.2"])
+    _, explicit = train.parse_args()
+    assert {"variant", "lambda_ccc"} <= explicit

@@ -29,12 +29,25 @@ BATCH_DIR = PACKAGE_ROOT / "batch-studies"
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
-#: The output channel a run trains. `heads` reads every score out of a regression head at a
-#: register; the emitted-score arms emit one grid token per score instead — `--ce-std` reads
-#: the argmax token off the grid (naive mode-seeking autoregression), while `--ce-rail`,
-#: `--raft-rail` and `--veil-rail` read the grid expectation. See the README section
-#: "Ablations & Variants".
-VARIANTS = ("heads", "ce_std", "ce_rail", "raft_rail", "veil_rail")
+#: The output channel a run trains. `heads` and `heads_bccc` read every score out of a
+#: regression head at a register; the emitted-score arms emit one grid token per score instead
+#: — `--ce-std` reads the argmax token off the grid (naive mode-seeking autoregression), while
+#: `--ce-rail`, `--raft-rail` and `--veil-rail` read the grid expectation. See the README
+#: section "Ablations & Variants".
+VARIANTS = ("heads", "heads_bccc", "ce_std", "ce_rail", "raft_rail", "veil_rail")
+HEAD_VARIANTS = ("heads", "heads_bccc")
+BCCC_VARIANTS = ("heads_bccc", "veil_rail")
+
+#: Default `lambda_ccc` per variant when `--lambda-ccc` is omitted. Vanilla `heads` keeps `0.5`
+#: (uncompensated buffer). Balanced CCC restores O(1) gradient pull via `(N + M) / M`, so
+#: `heads_bccc` lowers `lambda_ccc` to `0.1` (~10% of log-cosh), and `veil_rail` lowers it to
+#: `0.05` because `[-1, 1]` targets have smaller variance (sigma ~ 0.3) while CCC is
+#: scale-invariant.
+DEFAULT_LAMBDA_CCC = 0.5
+BCCC_DEFAULT_LAMBDA_CCC: dict[str, float] = {
+    "heads_bccc": 0.1,
+    "veil_rail": 0.05,
+}
 
 #: What each variant still needs before it can train. The guard exists because a parsed flag
 #: that nothing reads is worse than no flag: the run would train the head model, record
@@ -92,10 +105,10 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     head_modes: HeadModeConfig = field(default_factory=HeadModeConfig)
-    #: One field, not a boolean per arm: `--ce-std`, `--ce-rail`, `--raft-rail` and `--veil-rail`
-    #: are alternatives to each other and to the default, so separate booleans would accept
-    #: conflicting arms and hand `Config.diff` a conflict with no meaning. `choices` is read
-    #: by the argparse binder, which derives one flag per non-default value.
+    #: One field, not a boolean per arm: `--heads-bccc`, `--ce-std`, `--ce-rail`, `--raft-rail`
+    #: and `--veil-rail` are alternatives to each other and to the default, so separate booleans
+    #: would accept conflicting arms and hand `Config.diff` a conflict with no meaning. `choices`
+    #: is read by the argparse binder, which derives one flag per non-default value.
     variant: str = field(default="heads", metadata={"choices": VARIANTS})
     model_id: str = "google/gemma-4-12B-it"
     device: str = "auto"
@@ -106,9 +119,19 @@ class Config:
     head_layers: int = 8
     layer_mixture: bool = True
     phone_conditioning: str = "film"
-    lambda_ccc: float = 0.5
+    lambda_ccc: float | None = field(
+        default=None,
+        metadata={
+            "type": float,
+            "help": "default: 0.5 (heads), 0.1 (heads_bccc), 0.05 (veil_rail)",
+        },
+    )
     lambda_lm: float = 0.5
     buffer_capacity: int = 512
+    #: Utterance-level CorrelationBuffer capacity under Balanced CCC (`heads_bccc`, `veil_rail`).
+    #: Keeps utterance history fresh (16 optimizer steps at effective batch 4) while phone and
+    #: word stay at `buffer_capacity` (512).
+    bccc_utterance_capacity: int = 64
     reweight_strength: float = 1.0
     reweight_max: float = 10.0
     lambda_detect: float = 0.5
@@ -137,6 +160,9 @@ class Config:
             raise SystemExit(
                 f"unknown variant {self.variant!r}; known variants: {', '.join(VARIANTS)}"
             )
+        if self.lambda_ccc is None:
+            resolved = BCCC_DEFAULT_LAMBDA_CCC.get(self.variant, DEFAULT_LAMBDA_CCC)
+            object.__setattr__(self, "lambda_ccc", resolved)
         # Under `--ce-std` and `--ce-rail` the emitted token is the only thing carrying a score,
         # and that token is trained by cross-entropy. Zeroing the text loss would leave the
         # objective with no score term at all and run for hours doing nothing.
@@ -162,7 +188,7 @@ class Config:
 
         Every emitted-score switch keys off this one value, so the arms cannot drift apart.
         """
-        return self.variant != "heads"
+        return self.variant not in HEAD_VARIANTS
 
     @property
     def score_ce(self) -> bool:
@@ -176,8 +202,19 @@ class Config:
 
     @property
     def uses_veil(self) -> bool:
-        """Whether VEIL extends RAFT with CCC, detection, and reweighting (`--veil-rail`)."""
+        """Whether VEIL extends RAFT with log-cosh, BCCC, detection, and reweighting."""
         return self.variant == "veil_rail"
+
+    @property
+    def uses_bccc(self) -> bool:
+        """Whether Balanced CCC is active (`--heads-bccc`, `--veil-rail`)."""
+        return self.variant in BCCC_VARIANTS
+
+    def buffer_level_capacities(self) -> dict[str, int]:
+        """Per-level buffer capacity overrides (utterance=64 under Balanced CCC)."""
+        if not self.uses_bccc:
+            return {}
+        return {"utterance": self.bccc_utterance_capacity}
 
     @property
     def score_readout(self) -> str:
@@ -273,20 +310,23 @@ def _add_field(group, field_def, default, flag: str, dest: str) -> None:
     # The dest carries the group prefix so `config_from_args` can reassemble the tree, but
     # the metavar shows the plain field name — `--data-levels LEVELS`, not `DATA__LEVELS`.
     metavar = field_def.name.upper()
+    explicit_type = field_def.metadata.get("type")
+    help_text = field_def.metadata.get("help")
     if isinstance(default, bool):
         group.add_argument(
             flag, dest=dest, action=argparse.BooleanOptionalAction,
-            default=default, help=f"(default: {default})",
+            default=default, help=help_text or f"(default: {default})",
         )
     elif isinstance(default, tuple):
         group.add_argument(
             flag, dest=dest, type=_comma_tuple, default=default, metavar=metavar,
-            help=f"comma-separated (default: {','.join(map(str, default))})",
+            help=help_text or f"comma-separated (default: {','.join(map(str, default))})",
         )
     else:
+        arg_type = explicit_type if explicit_type is not None else type(default)
         group.add_argument(
-            flag, dest=dest, type=type(default), default=default, metavar=metavar,
-            help=f"(default: {default})",
+            flag, dest=dest, type=arg_type, default=default, metavar=metavar,
+            help=help_text or f"(default: {default})",
         )
 
 
@@ -335,7 +375,8 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         if choices:
             _add_choice_field(group, getattr(defaults, f.name), choices, flag, f.name)
         else:
-            _add_field(group, f, getattr(defaults, f.name), flag, f.name)
+            raw_default = f.default if f.default is not argparse.SUPPRESS and f.default is None else getattr(defaults, f.name)
+            _add_field(group, f, raw_default, flag, f.name)
 
 
 def config_from_args(args: argparse.Namespace) -> Config:

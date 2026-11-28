@@ -283,9 +283,13 @@ def main() -> None:
             detect_pos_weight=config.detect_pos_weight,
             lambda_raft=config.lambda_raft if config.uses_raft else 0.0,
             use_veil=config.uses_veil,
+            balanced_ccc=config.uses_bccc,
         )
         reweighter = build_reweighter(train_utterances, loss_config)
-        buffer = CorrelationBuffer(loss_config.buffer_capacity)
+        buffer = CorrelationBuffer(
+            loss_config.buffer_capacity,
+            level_capacities=config.buffer_level_capacities(),
+        )
 
         # -- optimisation -------------------------------------------------------------
         steps_per_epoch = max(

@@ -68,13 +68,27 @@ class CorrelationBuffer:
     head per step for no benefit.
     """
 
-    def __init__(self, capacity: int = 512):
+    def __init__(
+        self,
+        capacity: int = 512,
+        level_capacities: dict[str, int] | None = None,
+    ):
         self.capacity = capacity
+        self.level_capacities: dict[str, int] = dict(level_capacities or {})
         self._predictions: dict[str, torch.Tensor] = {}
         self._targets: dict[str, torch.Tensor] = {}
 
-    def extend(self, key: str, prediction: torch.Tensor, target: torch.Tensor) -> None:
+    def capacity_for(self, key: str) -> int:
         if self.capacity <= 0:
+            return 0
+        level = key.split(".", 1)[0]
+        if level in self.level_capacities:
+            return min(self.capacity, max(0, int(self.level_capacities[level])))
+        return self.capacity
+
+    def extend(self, key: str, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        cap = self.capacity_for(key)
+        if cap <= 0:
             return
         pred = prediction.detach().flatten().float()
         tgt = target.detach().flatten().float()
@@ -82,10 +96,10 @@ class CorrelationBuffer:
         # the host, and concatenating across devices segfaults on MPS rather than raising.
         self._predictions[key] = torch.cat(
             [self._history(self._predictions, key, pred), pred]
-        )[-self.capacity :]
+        )[-cap:]
         self._targets[key] = torch.cat(
             [self._history(self._targets, key, tgt), tgt]
-        )[-self.capacity :]
+        )[-cap:]
 
     @staticmethod
     def _history(store: dict[str, torch.Tensor], key: str, live: torch.Tensor) -> torch.Tensor:
@@ -113,12 +127,14 @@ class CorrelationBuffer:
         its moments from a handful of points for the first few hundred steps."""
         return {
             "capacity": self.capacity,
+            "level_capacities": dict(self.level_capacities),
             "predictions": {k: v.cpu() for k, v in self._predictions.items()},
             "targets": {k: v.cpu() for k, v in self._targets.items()},
         }
 
     def load_state_dict(self, state: dict) -> None:
         self.capacity = state["capacity"]
+        self.level_capacities = dict(state.get("level_capacities", {}))
         self._predictions = dict(state["predictions"])
         self._targets = dict(state["targets"])
 
@@ -169,8 +185,13 @@ class LossConfig:
     #: score term at all and the config refuses it.
     lambda_raft: float = 1.0
     #: Enable VEIL (Variance & Expectation Informed Language loss) on grid logits: extends
-    #: RAFT with label reweighting, ceiling detection (phone/word), and CCC + buffer.
+    #: RAFT with log-cosh pointwise error, label reweighting, phone/word ceiling detection,
+    #: and Balanced CCC.
     use_veil: bool = False
+    #: Enable Balanced CCC (`--heads-bccc`, `--veil-rail`): straight-through `(N + M) / M`
+    #: gradient compensation for detached buffer entries, plus vote-scale CCC on binomial
+    #: heads (paired with per-level utterance capacity 64 on `CorrelationBuffer`).
+    balanced_ccc: bool = False
 
 
 #: Reweighted whether or not its level is listed — see LossConfig.
@@ -372,6 +393,30 @@ def raft_loss(
     return total, parts
 
 
+def _ccc_term(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    key: str,
+    config: LossConfig,
+    buffer: CorrelationBuffer | None,
+) -> tuple[torch.Tensor, float]:
+    """`(1 - CCC)` loss term (with optional straight-through `(N + M) / M` scaling) and CCC float."""
+    if buffer is not None:
+        augmented_pred, augmented_target = buffer.augmented(key, pred, target)
+    else:
+        augmented_pred, augmented_target = pred, target
+    ccc = concordance(augmented_pred, augmented_target)
+    raw_loss = 1.0 - ccc
+    if config.balanced_ccc and pred.numel() > 0:
+        scale = float(augmented_pred.numel()) / float(pred.numel())
+        # Straight-through scaling: backward receives the unbiased (N + M) / M gradient while
+        # the forward scalar (and logged loss/total) stays on the [0, 2] scale.
+        loss = raw_loss.detach() + scale * (raw_loss - raw_loss.detach())
+    else:
+        loss = raw_loss
+    return loss, float(ccc.detach())
+
+
 def veil_loss(
     supports: dict,
     score_logits: dict[str, torch.Tensor],
@@ -382,12 +427,15 @@ def veil_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """VEIL (Variance & Expectation Informed Language loss): composite loss on grid tokens.
 
-    Extends RAFT with the three anti-collapse mechanisms from the head path:
+    Extends RAFT with the anti-collapse mechanisms from the head path:
+    - `log_cosh` on the normalized grid expectation instead of squared error, bounding spike
+      gradients on synthetic negatives and 10x-reweighted low scores
     - capped inverse-frequency reweighting on `reweight_levels` and `ALWAYS_REWEIGHTED`
     - ceiling-detection BCE on `VEIL_DETECT_LEVELS` (`phone`, `word`) to counter endpoint
       softmax saturation when p_top approaches 1
-    - `1 - CCC` with `CorrelationBuffer`, both on the grid's `[-1, 1]` span so `word.stress`
-      compares 0-5 vote counts rather than mixing vote expectations with 5/10 median z-scores
+    - Balanced `1 - CCC` with `CorrelationBuffer`, both on the grid's `[-1, 1]` span so
+      `word.stress` compares 0-5 vote counts rather than mixing vote expectations with
+      5/10 median z-scores
     """
     total: torch.Tensor | None = None
     parts: dict[str, float] = {}
@@ -404,7 +452,7 @@ def veil_loss(
         pred = support.expectation_normalized(logits_f32)
         gold = support.normalize_value(batch.raw).to(pred.dtype)
 
-        elementwise = (pred - gold) ** 2
+        elementwise = log_cosh(pred, gold)
         if reweighter is not None and (
             level in config.reweight_levels or key in ALWAYS_REWEIGHTED
         ):
@@ -422,13 +470,9 @@ def veil_loss(
                 parts[f"detect/{key}"] = float(detection.detach())
 
         if config.lambda_ccc > 0.0:
-            if buffer is not None:
-                augmented_pred, augmented_target = buffer.augmented(key, pred, gold)
-            else:
-                augmented_pred, augmented_target = pred, gold
-            ccc = concordance(augmented_pred, augmented_target)
-            term = term + config.lambda_ccc * (1.0 - ccc)
-            parts[f"ccc/{key}"] = float(ccc.detach())
+            ccc_loss, ccc_val = _ccc_term(pred, gold, key, config, buffer)
+            term = term + config.lambda_ccc * ccc_loss
+            parts[f"ccc/{key}"] = ccc_val
 
         if buffer is not None:
             buffer.extend(key, pred, gold)
@@ -495,19 +539,22 @@ def composite_loss(
                 term = term + config.lambda_detect * detection
                 parts[f"detect/{key}"] = float(detection.detach())
 
+        if config.balanced_ccc and head.mode == "binomial":
+            # Vote-scale alignment: Beta-Binomial(n, nu*p, nu*(1-p)) has exact mean n*p,
+            # mapped onto [-1, 1] alongside the observed 0..n vote count (`batch.raw`) so
+            # Balanced CCC sees the 20%-dissent panel instead of the 99:1 median.
+            ccc_pred = 2.0 * torch.sigmoid(logits.squeeze(-1).float()) - 1.0
+            ccc_target = 2.0 * (batch.raw.float() / float(head.n_raters)) - 1.0
+        else:
+            ccc_pred, ccc_target = normalized, batch.target
+
         if config.lambda_ccc > 0.0:
-            if buffer is not None:
-                augmented_pred, augmented_target = buffer.augmented(
-                    key, normalized, batch.target
-                )
-            else:
-                augmented_pred, augmented_target = normalized, batch.target
-            ccc = concordance(augmented_pred, augmented_target)
-            term = term + config.lambda_ccc * (1.0 - ccc)
-            parts[f"ccc/{key}"] = float(ccc.detach())
+            ccc_loss, ccc_val = _ccc_term(ccc_pred, ccc_target, key, config, buffer)
+            term = term + config.lambda_ccc * ccc_loss
+            parts[f"ccc/{key}"] = ccc_val
 
         if buffer is not None:
-            buffer.extend(key, normalized, batch.target)
+            buffer.extend(key, ccc_pred, ccc_target)
 
         total = total + weight * term
 

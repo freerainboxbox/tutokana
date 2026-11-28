@@ -499,3 +499,125 @@ def test_veil_loss_without_slots_raises():
 
     with pytest.raises(RuntimeError, match="no supervised score slot"):
         veil_loss({}, {}, {}, LossConfig(use_veil=True))
+
+
+def test_veil_loss_uses_log_cosh_instead_of_mse():
+    from tutokana.collate import HeadBatch
+    from tutokana.losses import raft_loss, veil_loss
+
+    support = _grid_support("phone", "accuracy", (0.0, 1.0, 2.0))
+    batch = HeadBatch(
+        positions=torch.zeros(2, 2, dtype=torch.long),
+        target=torch.zeros(2),
+        raw=torch.tensor([0.0, 0.0]),  # gold = -1.0
+        native=torch.tensor([0.0, 0.0]),
+    )
+    # Confident prediction at 2.0 -> pred ~ +1.0, residual |r| ~ 2.0 (synthetic negative case).
+    logits = torch.tensor([[-20.0, -20.0, 20.0], [-20.0, -20.0, 20.0]])
+    cfg = LossConfig(lambda_ccc=0.0, lambda_detect=0.0)
+    r_loss, _ = raft_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, cfg)
+    v_loss, _ = veil_loss({"phone.accuracy": support}, {"phone.accuracy": logits}, {"phone.accuracy": batch}, cfg)
+
+    pred = support.expectation_normalized(logits)
+    gold = support.normalize_value(batch.raw)
+    torch.testing.assert_close(v_loss, log_cosh(pred, gold).mean(), atol=1e-5, rtol=1e-5)
+    assert float(v_loss) < float(r_loss) / 2.5
+
+
+def test_correlation_buffer_supports_per_level_capacities_and_round_trips():
+    buf = CorrelationBuffer(capacity=512, level_capacities={"utterance": 64})
+    buf.extend("utterance.total", torch.randn(100), torch.randn(100))
+    buf.extend("phone.accuracy", torch.randn(100), torch.randn(100))
+    assert len(buf._predictions["utterance.total"]) == 64
+    assert len(buf._predictions["phone.accuracy"]) == 100
+
+    restored = CorrelationBuffer(capacity=1)
+    restored.load_state_dict(buf.state_dict())
+    assert restored.level_capacities == {"utterance": 64}
+    restored.extend("utterance.total", torch.randn(10), torch.randn(10))
+    assert len(restored._predictions["utterance.total"]) == 64
+
+    # Backwards compatibility: old checkpoints without `level_capacities` still load.
+    legacy = {"capacity": 32, "predictions": {}, "targets": {}}
+    restored.load_state_dict(legacy)
+    assert restored.level_capacities == {}
+
+    # Global capacity=0 disables every level even when level_capacities is set.
+    disabled = CorrelationBuffer(capacity=0, level_capacities={"utterance": 64})
+    disabled.extend("utterance.total", torch.randn(10), torch.randn(10))
+    assert disabled._predictions == {}
+
+
+def test_balanced_ccc_scales_gradient_by_n_plus_m_over_m_without_inflating_forward_loss():
+    from tutokana.losses import _ccc_term
+
+    torch.manual_seed(0)
+    buf = CorrelationBuffer(capacity=64)
+    buf.extend("utterance.total", torch.randn(64), torch.randn(64))
+
+    p_unbal = torch.tensor([0.3], requires_grad=True)
+    p_bal = p_unbal.detach().clone().requires_grad_(True)
+    target = torch.tensor([-0.7])
+
+    loss_unbal, ccc_unbal = _ccc_term(
+        p_unbal, target, "utterance.total", LossConfig(balanced_ccc=False), buf
+    )
+    loss_bal, ccc_bal = _ccc_term(
+        p_bal, target, "utterance.total", LossConfig(balanced_ccc=True), buf
+    )
+    # Straight-through: forward scalar and logged CCC stay identical.
+    assert ccc_bal == pytest.approx(ccc_unbal)
+    torch.testing.assert_close(loss_bal, loss_unbal)
+
+    loss_unbal.backward()
+    loss_bal.backward()
+    # Backward gradient is multiplied by (N + M) / M = 65 / 1.
+    torch.testing.assert_close(p_bal.grad, 65.0 * p_unbal.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_heads_bccc_uses_vote_scale_for_binomial_stress_ccc():
+    from tutokana.collate import HeadBatch
+    from tutokana.heads import HeadBank
+    from tutokana.losses import composite_loss
+
+    specs = {
+        "word.stress": {
+            "mode": "binomial",
+            "support": (5.0, 10.0),
+            "n_raters": 5,
+            "concentration": 8.6,
+            "mean": 9.95,
+            "std": 0.5,
+        }
+    }
+    bank = HeadBank(8, specs, ("word",), n_layers=1)
+    logits = {"word.stress": torch.tensor([[0.0], [2.0], [-2.0], [1.0]], requires_grad=True)}
+    heads = {
+        "word.stress": HeadBatch(
+            positions=torch.zeros(4, 2, dtype=torch.long),
+            # Extreme z-scored 99:1 median values vs 0..5 vote counts in `raw`.
+            target=torch.tensor([0.1, 0.1, -9.9, 0.1]),
+            raw=torch.tensor([5.0, 4.0, 1.0, 3.0]),
+            native=torch.tensor([10.0, 10.0, 5.0, 10.0]),
+            word_index=torch.arange(4),
+        )
+    }
+
+    buf_bccc = CorrelationBuffer(capacity=512)
+    composite_loss(
+        bank, logits, heads, LossConfig(lambda_ccc=0.1, balanced_ccc=True), buffer=buf_bccc
+    )
+    # Vote counts [5, 4, 1, 3] / 5 mapped to [-1, 1] -> [1.0, 0.6, -0.6, 0.2].
+    expected_targets = torch.tensor([1.0, 0.6, -0.6, 0.2])
+    torch.testing.assert_close(buf_bccc._targets["word.stress"], expected_targets, atol=1e-5, rtol=1e-5)
+    assert buf_bccc._predictions["word.stress"].abs().max().item() <= 1.0 + 1e-6
+
+    buf_plain = CorrelationBuffer(capacity=512)
+    composite_loss(
+        bank,
+        {"word.stress": logits["word.stress"].detach()},
+        heads,
+        LossConfig(lambda_ccc=0.5, balanced_ccc=False),
+        buffer=buf_plain,
+    )
+    torch.testing.assert_close(buf_plain._targets["word.stress"], heads["word.stress"].target)

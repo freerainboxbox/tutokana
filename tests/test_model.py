@@ -890,13 +890,13 @@ def test_raft_loss_descends_when_stepped_on_the_grid(raft):
 
 
 def test_veil_loss_reaches_delta_and_passes_preflight(raft):
-    """`--veil-rail` applies composite anti-collapse terms on grid logits and restores buffer."""
+    """`--veil-rail` applies log-cosh + BCCC + detection on grid logits and restores buffer."""
     from tutokana.losses import CorrelationBuffer, build_reweighter
 
     model, collator, sample = raft
-    cfg = LossConfig(lambda_lm=0.5, lambda_raft=1.0, use_veil=True)
+    cfg = LossConfig(lambda_lm=0.5, lambda_raft=1.0, lambda_ccc=0.05, use_veil=True, balanced_ccc=True)
     reweighter = build_reweighter(sample, cfg)
-    buffer = CorrelationBuffer(capacity=64)
+    buffer = CorrelationBuffer(capacity=64, level_capacities={"utterance": 16})
 
     # Preflight must succeed and leave the correlation buffer untouched.
     preflight(model, collator, sample[:2], CPU, cfg, reweighter=reweighter, buffer=buffer)
@@ -920,6 +920,33 @@ def test_veil_loss_reaches_delta_and_passes_preflight(raft):
     loss.backward()
     assert model.register_delta.delta.grad is not None
     assert float(model.register_delta.delta.grad.abs().sum()) > 0.0
+
+
+def test_heads_bccc_passes_preflight_and_uses_vote_scale_buffer(wired):
+    """`--heads-bccc` trains the regression-head path with Balanced CCC and utterance cap."""
+    from tutokana.losses import CorrelationBuffer, build_reweighter
+
+    model, collator, sample = wired
+    cfg = LossConfig(lambda_ccc=0.1, lambda_lm=0.5, balanced_ccc=True)
+    reweighter = build_reweighter(sample, cfg)
+    buffer = CorrelationBuffer(capacity=512, level_capacities={"utterance": 64})
+
+    preflight(model, collator, sample[:2], CPU, cfg, reweighter=reweighter, buffer=buffer)
+    assert buffer._predictions == {}
+
+    batch = move_batch(collator(sample[:2]), CPU)
+    head_outputs, lm_loss, _ = model(batch)
+    loss, parts = composite_loss(
+        model.heads, head_outputs, batch["heads"], cfg,
+        buffer=buffer, reweighter=reweighter, lm_loss=lm_loss,
+    )
+    assert "ccc/utterance.total" in parts
+    assert buffer._targets["word.stress"].abs().max().item() <= 1.0 + 1e-6
+    loss.backward()
+    for key in head_outputs:
+        assert any(
+            p.grad is not None and p.grad.any() for p in model.heads.head(key).parameters()
+        ), key
 
 
 # --- the --ce-std arm: mode-seeking autoregression restricted to the grid ----------------
